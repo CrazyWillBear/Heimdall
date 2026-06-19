@@ -34,7 +34,13 @@ from typing import Any
 from arq.connections import RedisSettings
 
 from heimdall.context import assemble_pr_context
-from heimdall.db import Database, get_last_reviewed_sha, set_last_reviewed_sha
+from heimdall.db import (
+    Database,
+    get_last_reviewed_sha,
+    get_posted_review,
+    set_last_reviewed_sha,
+    set_posted_review,
+)
 from heimdall.github import GitHubClient
 from heimdall.lens import (
     CLEANLINESS_LENS,
@@ -129,6 +135,15 @@ async def run_review(
         if synthesis is None:
             return  # Pipeline failed; failure already logged. Do not post or record SHA.
 
+        # Across-push lifecycle: retire the prior Heimdall review (dismiss a
+        # REQUEST_CHANGES, minimize a COMMENT) before posting so only the latest
+        # review stays active.
+        await _refresh_prior_review(
+            github_client,
+            db,
+            repo_full_name=repo_full_name,
+            pr_number=pr_number,
+        )
         logger.info(
             "Posting %s review for %s#%d @ %s",
             synthesis.verdict,
@@ -136,12 +151,20 @@ async def run_review(
             pr_number,
             head_sha,
         )
-        await github_client.post_review(
+        posted = await github_client.post_review(
             repo_full_name=repo_full_name,
             pr_number=pr_number,
             commit_id=head_sha,
             body=synthesis.body,
             event=synthesis.verdict,
+        )
+        await set_posted_review(
+            db,
+            repo_full_name=repo_full_name,
+            pr_number=pr_number,
+            review_id=int(posted["id"]),
+            node_id=str(posted["node_id"]),
+            verdict=synthesis.verdict,
         )
         await set_last_reviewed_sha(
             db, repo_full_name=repo_full_name, pr_number=pr_number, sha=head_sha
@@ -151,6 +174,37 @@ async def run_review(
         )
     finally:
         await github_client.aclose()
+
+
+async def _refresh_prior_review(
+    github_client: GitHubClient,
+    db: Database,
+    *,
+    repo_full_name: str,
+    pr_number: int,
+) -> None:
+    """Retire the prior Heimdall review for a PR, if any, before a fresh post.
+
+    Reads the prior posted-review record from SQLite and acts per its stored
+    verdict: a REQUEST_CHANGES review is dismissed (it carries a blocking
+    state), while a COMMENT review is minimized (dismissal is invalid for
+    COMMENT events).  No-op when there is no prior review on record.
+    """
+    prior = await get_posted_review(
+        db, repo_full_name=repo_full_name, pr_number=pr_number
+    )
+    if prior is None:
+        return
+
+    if prior["verdict"] == "REQUEST_CHANGES":
+        await github_client.dismiss_review(
+            repo_full_name=repo_full_name,
+            pr_number=pr_number,
+            review_id=int(prior["review_id"]),
+            message="Superseded by a newer push; Heimdall re-reviewed the PR.",
+        )
+    else:
+        await github_client.minimize_review(node_id=str(prior["node_id"]))
 
 
 async def _synthesize_review(

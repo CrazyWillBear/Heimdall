@@ -48,8 +48,12 @@ def _patch_review_pipeline(
     synthesis_result: SynthesisResult | None = None,
     synthesis_side_effect: BaseException | None = None,
     last_sha: str | None = None,
+    prior_review: dict[str, object] | None = None,
 ) -> tuple[ExitStack, AsyncMock]:
     """Patch the worker's seed-assembly, lens run, synthesis, and SHA helpers.
+
+    Also patches the across-push persistence helpers (``get_posted_review`` so a
+    prior-review record can be injected via ``prior_review``).
 
     Returns the ExitStack (used under ``with``) plus the run_synthesis mock so a
     test can assert what reached synthesis.
@@ -57,6 +61,12 @@ def _patch_review_pipeline(
     stack = ExitStack()
     stack.enter_context(
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=last_sha))
+    )
+    stack.enter_context(
+        patch(
+            "heimdall.worker.get_posted_review",
+            new=AsyncMock(return_value=prior_review),
+        )
     )
     stack.enter_context(
         patch("heimdall.worker.assemble_pr_context", new=AsyncMock(return_value=MagicMock()))
@@ -78,6 +88,13 @@ def _patch_review_pipeline(
     return stack, synth_mock
 
 
+def _gh_client(*, review_id: int = 1, node_id: str = "NODE") -> AsyncMock:
+    """Return a mock GitHubClient whose post_review yields an id and node_id."""
+    client = AsyncMock()
+    client.post_review = AsyncMock(return_value={"id": review_id, "node_id": node_id})
+    return client
+
+
 # ---------------------------------------------------------------------------
 # run_review: ctx contract — builds GitHubClient per job from app credentials
 # ---------------------------------------------------------------------------
@@ -94,8 +111,7 @@ def _tagged(severity: Severity, lens: str, title: str = "t", message: str = "m")
 async def test_run_review_posts_exactly_one_review() -> None:
     """Worker builds a per-job GitHubClient and posts exactly one synthesized review."""
     mock_db = AsyncMock()
-    mock_gh_client = AsyncMock()
-    mock_gh_client.post_review = AsyncMock()
+    mock_gh_client = _gh_client()
 
     ctx: dict[str, object] = {
         "db": mock_db,
@@ -107,6 +123,7 @@ async def test_run_review_posts_exactly_one_review() -> None:
     with (
         _patch_review_pipeline(synthesis_result=synthesis)[0],
         patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()) as mock_set,
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
         patch("heimdall.worker.GitHubClient", return_value=mock_gh_client) as mock_cls,
     ):
         await run_review(
@@ -132,7 +149,7 @@ async def test_run_review_posts_exactly_one_review() -> None:
 @pytest.mark.asyncio
 async def test_run_review_fans_out_three_lenses_into_synthesis() -> None:
     """All three lenses run and their results reach synthesis (mocked claude)."""
-    mock_gh_client = AsyncMock()
+    mock_gh_client = _gh_client()
     ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
 
     lens_results = [
@@ -147,6 +164,7 @@ async def test_run_review_fans_out_three_lenses_into_synthesis() -> None:
     with (
         stack,
         patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
         patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
     ):
         await run_review(
@@ -168,7 +186,7 @@ async def test_run_review_fans_out_three_lenses_into_synthesis() -> None:
 @pytest.mark.asyncio
 async def test_run_review_body_is_severity_grouped_and_lens_tagged() -> None:
     """The posted body groups synthesized findings by severity, each tagged by lens."""
-    mock_gh_client = AsyncMock()
+    mock_gh_client = _gh_client()
     ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
 
     synthesis = _synthesis_from(
@@ -207,6 +225,7 @@ async def test_run_review_verdict_reflects_highest_surviving_severity() -> None:
     with (
         _patch_review_pipeline(synthesis_result=synthesis)[0],
         patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
         patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
     ):
         await run_review(
@@ -223,12 +242,13 @@ async def test_run_review_verdict_reflects_highest_surviving_severity() -> None:
 @pytest.mark.asyncio
 async def test_run_review_no_surviving_findings_posts_comment() -> None:
     """When synthesis keeps only medium/low (or nothing), the event is COMMENT."""
-    mock_gh_client = AsyncMock()
+    mock_gh_client = _gh_client()
     ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
 
     with (
         _patch_review_pipeline(synthesis_result=_synthesis_from([]))[0],
         patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
         patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
     ):
         await run_review(
@@ -245,7 +265,7 @@ async def test_run_review_no_surviving_findings_posts_comment() -> None:
 @pytest.mark.asyncio
 async def test_run_review_isolates_one_lens_failure() -> None:
     """One failing lens does not crash the pipeline; synthesis still runs on survivors."""
-    mock_gh_client = AsyncMock()
+    mock_gh_client = _gh_client()
     ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
 
     # Security succeeds, Design times out, Cleanliness succeeds.
@@ -257,6 +277,9 @@ async def test_run_review_isolates_one_lens_failure() -> None:
     stack = ExitStack()
     stack.enter_context(
         patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None))
+    )
+    stack.enter_context(
+        patch("heimdall.worker.get_posted_review", new=AsyncMock(return_value=None))
     )
     stack.enter_context(
         patch("heimdall.worker.assemble_pr_context", new=AsyncMock(return_value=MagicMock()))
@@ -271,6 +294,7 @@ async def test_run_review_isolates_one_lens_failure() -> None:
     with (
         stack,
         patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
         patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
     ):
         await run_review(
@@ -373,13 +397,13 @@ async def test_run_review_skips_already_reviewed_sha() -> None:
 @pytest.mark.asyncio
 async def test_run_review_closes_github_client_after_posting() -> None:
     """run_review closes the GitHubClient after posting a review (no FD leak)."""
-    mock_gh_client = AsyncMock()
-    mock_gh_client.post_review = AsyncMock()
+    mock_gh_client = _gh_client()
     ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
 
     with (
         _patch_review_pipeline(synthesis_result=_synthesis_from([]))[0],
         patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
         patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
     ):
         await run_review(
@@ -412,6 +436,121 @@ async def test_run_review_closes_github_client_on_skip_path() -> None:
         )
 
     mock_gh_client.aclose.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# run_review: across-push review lifecycle (dismiss / minimize prior)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_review_dismisses_prior_request_changes() -> None:
+    """A prior REQUEST_CHANGES review is dismissed before the fresh one is posted."""
+    mock_gh_client = _gh_client(review_id=2, node_id="NODE2")
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    prior = {"review_id": 1, "node_id": "NODE1", "verdict": "REQUEST_CHANGES"}
+    with (
+        _patch_review_pipeline(synthesis_result=_synthesis_from([]), prior_review=prior)[0],
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    mock_gh_client.dismiss_review.assert_awaited_once()
+    assert mock_gh_client.dismiss_review.await_args.kwargs["review_id"] == 1
+    mock_gh_client.minimize_review.assert_not_called()
+    mock_gh_client.post_review.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_review_minimizes_prior_comment() -> None:
+    """A prior COMMENT review is minimized (not dismissed) before posting the fresh one."""
+    mock_gh_client = _gh_client(review_id=2, node_id="NODE2")
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    prior = {"review_id": 1, "node_id": "NODE1", "verdict": "COMMENT"}
+    with (
+        _patch_review_pipeline(synthesis_result=_synthesis_from([]), prior_review=prior)[0],
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    mock_gh_client.minimize_review.assert_awaited_once_with(node_id="NODE1")
+    mock_gh_client.dismiss_review.assert_not_called()
+    mock_gh_client.post_review.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_review_persists_new_review_after_posting() -> None:
+    """run_review stores the fresh review's id, node id, and verdict after posting."""
+    mock_db = AsyncMock()
+    mock_gh_client = _gh_client(review_id=99, node_id="NODE99")
+    ctx: dict[str, object] = {"db": mock_db, "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    synthesis = _synthesis_from([_tagged(Severity.HIGH, "security", "x")])
+    with (
+        _patch_review_pipeline(synthesis_result=synthesis)[0],
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()) as mock_persist,
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    mock_persist.assert_awaited_once_with(
+        mock_db,
+        repo_full_name=_REPO,
+        pr_number=_PR,
+        review_id=99,
+        node_id="NODE99",
+        verdict="REQUEST_CHANGES",
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_review_first_review_does_not_refresh() -> None:
+    """With no prior review on record, nothing is dismissed or minimized."""
+    mock_gh_client = _gh_client()
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    with (
+        _patch_review_pipeline(synthesis_result=_synthesis_from([]), prior_review=None)[0],
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    mock_gh_client.dismiss_review.assert_not_called()
+    mock_gh_client.minimize_review.assert_not_called()
+    mock_gh_client.post_review.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
