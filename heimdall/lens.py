@@ -18,7 +18,9 @@ Security posture of the invocation (see :func:`build_claude_argv`):
     shell-injection surface);
   * allowed tools are the read-only Read/Grep/Glob plus the single allowlisted
     ``heimdall-context`` Bash wrapper — never raw Bash, Write, or Edit;
-  * Bash/Write/Edit are also explicitly disallowed as defense in depth.
+  * Write/Edit are explicitly disallowed; raw Bash needs no deny rule because
+    default-deny already blocks anything off the allowlist, and an unscoped Bash
+    deny would take precedence over (and neuter) the wrapper's allow rule.
 """
 
 from __future__ import annotations
@@ -152,8 +154,11 @@ _DEFAULT_PROMPT = (
 # Read-only tools plus the single allowlisted Bash wrapper. A bare "Bash" is
 # never allowed; Bash is scoped to the heimdall-context command only.
 _ALLOWED_TOOLS = "Read Grep Glob Bash(heimdall-context *)"
-# Defense in depth: explicitly deny raw Bash and any mutation.
-_DISALLOWED_TOOLS = "Bash Write Edit"
+# Deny mutating tools only. An unscoped "Bash" deny would take precedence over the
+# Bash(heimdall-context *) allow rule (deny wins) and neuter the wrapper, so it is
+# intentionally absent: under default-deny, raw Bash is already blocked by not
+# being allowed.
+_DISALLOWED_TOOLS = "Write Edit"
 
 
 def build_claude_argv(
@@ -167,9 +172,10 @@ def build_claude_argv(
 
     The invocation pins opus at max effort with JSON output, restricts tools to
     read-only Read/Grep/Glob plus the allowlisted ``heimdall-context`` Bash
-    wrapper, and explicitly disallows raw Bash/Write/Edit.  argv is consumed by
-    ``create_subprocess_exec`` (no shell), so none of these strings are
-    shell-interpreted.
+    wrapper, and disallows Write/Edit.  Raw Bash carries no deny rule (an unscoped
+    Bash deny would override the wrapper's allow rule); default-deny blocks it.
+    argv is consumed by ``create_subprocess_exec`` (no shell), so none of these
+    strings are shell-interpreted.
 
     Args:
         claude_binary: Path or name of the claude executable.

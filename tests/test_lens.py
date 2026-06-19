@@ -201,8 +201,14 @@ def test_argv_forbids_raw_bash_and_write_tools() -> None:
     assert any("Bash(heimdall-context" in t for t in tools)
 
 
-def test_argv_disallows_raw_bash_explicitly() -> None:
-    """Bash and Write are explicitly disallowed as a defense-in-depth measure."""
+def test_argv_disallows_mutating_tools_without_subsuming_bash_wrapper() -> None:
+    """Write/Edit are denied, but no unscoped Bash deny subsumes the wrapper.
+
+    Deny rules take precedence over allow rules, and an unscoped ``Bash`` deny
+    matches every Bash invocation — including ``Bash(heimdall-context *)``. Such
+    a token would neuter the allowlisted wrapper at runtime, so the deny list must
+    not contain a bare ``Bash``. Raw Bash stays blocked by default-deny anyway.
+    """
     argv = build_claude_argv(
         claude_binary="claude",
         workspace_dir=_WORKSPACE,
@@ -211,9 +217,41 @@ def test_argv_disallows_raw_bash_explicitly() -> None:
     )
     assert "--disallowedTools" in argv
     disallowed = argv[argv.index("--disallowedTools") + 1]
-    assert "Bash" in disallowed
-    assert "Write" in disallowed
-    assert "Edit" in disallowed
+    disallowed_tools = [t.strip() for t in disallowed.replace(",", " ").split()]
+    # Mutating tools remain explicitly denied.
+    assert "Write" in disallowed_tools
+    assert "Edit" in disallowed_tools
+    # No unscoped Bash deny — it would subsume the Bash(heimdall-context *) allow.
+    assert "Bash" not in disallowed_tools
+    assert not any(t.startswith("Bash") and "heimdall-context" in t for t in disallowed_tools)
+
+
+def test_argv_allow_deny_lets_wrapper_through_but_blocks_raw_bash() -> None:
+    """The allow/deny pair permits the wrapper while raw Bash stays denied.
+
+    Pins the allow/deny interaction: ``Bash(heimdall-context *)`` is the only Bash
+    form on the allow list, and the deny list carries no token that would also
+    match it. Under default-deny, any other ``Bash(...)`` is rejected because it is
+    simply not allowed — without an unscoped deny that would kill the wrapper too.
+    """
+    argv = build_claude_argv(
+        claude_binary="claude",
+        workspace_dir=_WORKSPACE,
+        lens=SECURITY_LENS,
+        prompt="review",
+    )
+    allowed = [t.strip() for t in argv[argv.index("--allowedTools") + 1].replace(",", " ").split()]
+    disallowed = [
+        t.strip() for t in argv[argv.index("--disallowedTools") + 1].replace(",", " ").split()
+    ]
+    # The wrapper is allowed and nothing in deny subsumes it (no bare Bash, no
+    # deny token that matches heimdall-context).
+    assert "Bash(heimdall-context" in " ".join(allowed)
+    assert "Bash" not in disallowed
+    # Raw Bash is not on the allow list, so default-deny rejects it.
+    assert not any(
+        t == "Bash" or (t.startswith("Bash(") and "heimdall-context" not in t) for t in allowed
+    )
 
 
 def test_argv_scopes_session_to_workspace() -> None:

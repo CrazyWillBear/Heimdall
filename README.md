@@ -22,8 +22,11 @@ runner.
 
 The invocation (`build_claude_argv`) pins **opus at max effort**, headless with JSON
 output, and restricts tools to read-only **Read/Grep/Glob** plus the single allowlisted
-**`heimdall-context`** Bash wrapper (`heimdall/context_cli.py`). Raw Bash, Write, and Edit
-are explicitly disallowed. The subprocess is spawned via `create_subprocess_exec` (no shell).
+**`heimdall-context`** Bash wrapper (`heimdall/context_cli.py`). **Write** and **Edit** are
+explicitly disallowed; raw Bash carries no deny rule because an unscoped `Bash` deny would
+take precedence over and neuter the wrapper's allow rule — under default-deny, anything off
+the allowlist (including raw Bash) is already blocked. The subprocess is spawned via
+`create_subprocess_exec` (no shell).
 
 Each run is bounded by a **per-agent cumulative-token cap** (default 400k) and a
 **wall-clock timeout** (default 1800s). Exceeding either kills the subprocess and raises
