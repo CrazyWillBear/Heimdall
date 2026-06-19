@@ -206,6 +206,71 @@ uv run arq heimdall.worker.WorkerSettings
 The `heimdall-context` console script is invoked internally by the lenses; you do not run it
 by hand.
 
+### Docker deployment
+
+`docker-compose.yml` brings up the whole stack — **web** (the FastAPI service), **worker**
+(the Arq worker), **redis** (the queue), and **caddy** (TLS termination + reverse proxy). The
+shared image (`deploy/Dockerfile`) installs heimdall **non-editable** under a venv plus `bwrap`,
+Node, and the `claude` CLI, so the lens sandbox can bind the venv read-only while the worker's
+project/state dir is never exposed.
+
+**1. Create the GitHub App (manifest flow).** Open `deploy/app-manifest.html` in a browser,
+enter your domain, and click **Create GitHub App** — GitHub creates an App with exactly the
+right permissions (Pull requests: read & write; Contents & Metadata: read) subscribed to
+`pull_request`, with its webhook pointed at `https://<domain>/webhook`. GitHub then redirects to
+`https://<domain>/?code=<CODE>` (a 404 page is fine — copy the `code` from the address bar) and
+you exchange it for the credentials:
+
+```
+gh api -X POST /app-manifests/<CODE>/conversions
+```
+
+From the JSON response: put `id` in `GITHUB_APP_ID` and `webhook_secret` in `WEBHOOK_SECRET`
+(in `.env`), and write `pem` to `secrets/github_app_private_key.pem`. Install the App on the
+repos you want reviewed.
+
+**2. Configure secrets.** Copy `.env.example` to `.env` and fill in `WEBHOOK_SECRET`,
+`GITHUB_APP_ID`, `ANTHROPIC_API_KEY`, and `DOMAIN`. The App private key is a multiline PEM that
+cannot live in an env file, so it is mounted as a Compose secret — put it at
+`secrets/github_app_private_key.pem` (both `.env` and `secrets/` are gitignored).
+
+**3. Point DNS at the host.** `DOMAIN` must resolve to this machine with ports 80 and 443 open;
+Caddy obtains a certificate automatically on first start.
+
+**4. Bring it up.**
+
+```
+docker compose up -d --build
+```
+
+**Sandbox requirements (worker only).** The worker runs each lens under `bwrap` using the
+**unprivileged user-namespace** path — no setuid, no added capabilities. Docker's default
+seccomp profile blocks user-namespace creation and masks `/proc`, so the worker service runs
+with `seccomp=unconfined` and `systempaths=unconfined` (already wired in `docker-compose.yml`,
+and applied to the worker alone). The worker runs its `bwrap` exec-probe at startup and
+**refuses to boot** if the sandbox can't run, so a misconfiguration surfaces immediately. Verify
+the sandbox inside the built image with:
+
+```
+docker compose run --rm worker bwrap --ro-bind / / --unshare-all --share-net -- true
+```
+
+An exit code of 0 means the sandbox works. (Do **not** add `no-new-privileges` expecting setuid
+semantics — this deployment uses the userns path, not setuid.)
+
+**Replaying a webhook (no public tunnel).** To exercise a real review without GitHub delivering
+a webhook (e.g. a private host), `scripts/replay_webhook.py` builds and signs a `pull_request`
+payload and POSTs it to the service (published on `127.0.0.1:8000` by Compose). The App
+credentials must be for a real installed App, since the worker still fetches the PR and posts the
+review via an installation token:
+
+```
+uv run python scripts/replay_webhook.py \
+    --repo owner/repo --pr 42 --sha <head-sha> --installation-id <id>
+```
+
+(`--secret` defaults to `$WEBHOOK_SECRET`, `--url` to `http://localhost:8000/webhook`.)
+
 ## Operation
 
 Once installed and configured:

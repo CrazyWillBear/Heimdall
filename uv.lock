@@ -263,7 +263,7 @@ wheels = [
 [[package]]
 name = "heimdall"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
     { name = "arq" },

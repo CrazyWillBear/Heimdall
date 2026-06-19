@@ -1,0 +1,87 @@
+name: heimdall
+
+# web and worker share one image (built once, reused).
+x-heimdall-build: &heimdall-build
+  context: .
+  dockerfile: deploy/Dockerfile
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  web:
+    build: *heimdall-build
+    image: heimdall:latest
+    restart: unless-stopped
+    command:
+      ["uvicorn", "--factory", "heimdall.app:create_app", "--host", "0.0.0.0", "--port", "8000"]
+    env_file: [.env]
+    environment:
+      REDIS_URL: redis://redis:6379
+    # Published on loopback so the signed-webhook replay helper can reach /webhook
+    # directly during dogfooding; in production Caddy fronts it over TLS.
+    ports:
+      - "127.0.0.1:8000:8000"
+    secrets:
+      - github_app_private_key
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: *heimdall-build
+    image: heimdall:latest
+    restart: unless-stopped
+    command: ["heimdall-worker"]
+    env_file: [.env]
+    environment:
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: sqlite+aiosqlite:////data/heimdall.db
+    # The lens sandbox uses bwrap's unprivileged user-namespace path (no setuid, no added
+    # capabilities).  Docker's default seccomp profile blocks user-namespace creation and
+    # masks /proc, so bwrap needs BOTH unconfined to create its namespaces and mount a
+    # fresh /proc.  The worker's startup exec-probe fails the boot if this is missing.
+    # Applies to the worker only — web/redis/caddy never run the sandbox.
+    security_opt:
+      - seccomp=unconfined
+      - systempaths=unconfined
+    volumes:
+      - worker_data:/data
+    secrets:
+      - github_app_private_key
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env for automatic HTTPS}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+
+volumes:
+  redis_data:
+  worker_data:
+  caddy_data:
+  caddy_config:
+
+secrets:
+  github_app_private_key:
+    file: ./secrets/github_app_private_key.pem

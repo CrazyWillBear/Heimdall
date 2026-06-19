@@ -807,8 +807,18 @@ def main() -> None:
 
     Invoked as ``heimdall-worker`` (see [project.scripts] in pyproject.toml)
     or directly with ``python -m heimdall.worker``.
+
+    Resolves ``WorkerSettings.redis_settings`` from the configured ``REDIS_URL`` here,
+    at process start: arq reads that class attribute when it constructs the Worker —
+    before ``on_startup`` runs — so the override must be applied now, not in on_startup
+    where it would land after the pool has already started connecting to localhost.
     """
     from arq.worker import run_worker
+
+    global settings
+    if settings is None:
+        settings = _load_settings()
+    WorkerSettings.redis_settings = RedisSettings.from_dsn(settings.redis_url)
 
     run_worker(WorkerSettings)  # type: ignore[arg-type]
 
@@ -821,9 +831,9 @@ class WorkerSettings:
     """
 
     functions = [run_review]
-    # RedisSettings is initialised from env at worker-launch time via on_startup;
-    # the default here points to localhost so the class attribute is always a
-    # valid RedisSettings instance (Arq will use it if not overridden).
+    # Overridden from the configured REDIS_URL in main() at process start (arq reads
+    # this attribute before on_startup runs); the localhost default keeps it a valid
+    # RedisSettings instance for the ``arq heimdall.worker.WorkerSettings`` launch path.
     redis_settings: RedisSettings = RedisSettings()
 
     @staticmethod
@@ -832,7 +842,7 @@ class WorkerSettings:
 
         Reads Settings from the environment, runs a trivial bwrap exec-probe that
         aborts startup (raising :class:`SandboxError`) on a host where the sandbox
-        cannot run, overrides redis_settings on the class, then populates ctx with:
+        cannot run, then populates ctx with:
             db:                     initialised Database instance
             app_id:                 GitHub App numeric ID
             private_key:            PEM-encoded RSA private key
@@ -854,10 +864,6 @@ class WorkerSettings:
         # at spawn time without a working sandbox (#26), so refuse to boot here and
         # surface the cause immediately rather than per-review.
         await sandbox_exec_probe(settings.bwrap_binary)
-
-        # Update redis_settings from the live config so the running worker uses
-        # the correct Redis URL even if the default was overridden in .env.
-        WorkerSettings.redis_settings = RedisSettings.from_dsn(settings.redis_url)
 
         db = Database(_db_path_from_url(settings.database_url))
         await db.initialize()

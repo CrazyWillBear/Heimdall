@@ -33,6 +33,16 @@ dev = [
 heimdall-worker = "heimdall.worker:main"
 heimdall-context = "heimdall.context_cli:main"
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Scope the wheel to the heimdall package so the build never tries to ship the
+# top-level tests/ and scripts/ dirs (and so the deploy image installs heimdall
+# non-editable under the venv, with real console-script entry points).
+[tool.hatch.build.targets.wheel]
+packages = ["heimdall"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
@@ -49,3 +59,6 @@ exclude = ["\\.venv", "build", "dist"]
 testpaths = ["tests"]
 addopts = "-q"
 asyncio_mode = "strict"
+# Put the repo root on sys.path so tests can import the dev-only scripts/ package
+# (the replay helper) alongside the installed heimdall package.
+pythonpath = ["."]

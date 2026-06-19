@@ -1,0 +1,6 @@
+# Caddy terminates TLS (automatic HTTPS via Let's Encrypt) and reverse-proxies to the
+# web service.  DOMAIN comes from the environment (set it in .env); it must be a public
+# DNS name pointing at this host with ports 80 and 443 reachable for the ACME challenge.
+{$DOMAIN} {
+	reverse_proxy web:8000
+}

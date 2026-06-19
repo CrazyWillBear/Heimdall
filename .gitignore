@@ -9,3 +9,7 @@ dist/
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
+# Deploy secrets / local state — never commit
+.env
+secrets/
+*.db

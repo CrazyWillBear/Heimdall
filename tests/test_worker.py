@@ -1040,6 +1040,27 @@ def test_worker_settings_has_redis_settings() -> None:
     assert isinstance(WorkerSettings.redis_settings, RedisSettings)
 
 
+def test_main_resolves_redis_settings_from_config() -> None:
+    """main() applies the configured Redis URL before arq builds the worker pool.
+
+    arq reads WorkerSettings.redis_settings when it constructs the Worker (before
+    on_startup runs), so the URL must be resolved at process start in main(); an
+    override left to on_startup lands after the pool is already connecting.
+    """
+    from heimdall.worker import main
+
+    with (
+        patch("arq.worker.run_worker") as mock_run,
+        patch("heimdall.worker.settings") as mock_settings,
+    ):
+        mock_settings.redis_url = "redis://example-redis:6390"
+        main()
+
+    mock_run.assert_called_once()
+    assert WorkerSettings.redis_settings.host == "example-redis"
+    assert WorkerSettings.redis_settings.port == 6390
+
+
 # ---------------------------------------------------------------------------
 # WorkerSettings.on_startup / on_shutdown lifecycle
 # ---------------------------------------------------------------------------
