@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     claude_binary: str = Field(
         default="claude", description="Path or name of the claude CLI executable"
     )
+    claude_env_passthrough: list[str] = Field(
+        default_factory=list,
+        description="Extra env-var names forwarded to the claude child beyond the "
+        "PATH/HOME/ANTHROPIC_API_KEY allowlist (e.g. HTTPS_PROXY, NODE_EXTRA_CA_CERTS)",
+    )
     lens_token_cap: int = Field(
         default=400_000, description="Per-agent cumulative-token cap for a lens run"
     )

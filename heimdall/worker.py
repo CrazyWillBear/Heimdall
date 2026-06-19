@@ -5,6 +5,7 @@ Context keys populated by WorkerSettings.on_startup:
     app_id:                 GitHub App numeric ID (int)
     private_key:            PEM-encoded RSA private key (str)
     claude_binary:          path/name of the claude CLI (str)
+    claude_env_passthrough: extra env keys forwarded to the claude child (list[str])
     lens_token_cap:         per-agent cumulative-token cap (int)
     lens_timeout_seconds:   per-lens wall-clock timeout (float)
     review_timeout_seconds: per-review wall-clock timeout across the pipeline (float)
@@ -650,6 +651,7 @@ async def _synthesize_review(
             claude_binary=ctx.get("claude_binary", "claude"),
             token_cap=ctx.get("lens_token_cap", DEFAULT_TOKEN_CAP),
             timeout_seconds=ctx.get("lens_timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
+            env_passthrough=ctx.get("claude_env_passthrough", []),
             blocking=blocking_severities(config.severity_threshold),
         )
     finally:
@@ -694,6 +696,7 @@ async def _run_lenses(
                 claude_binary=ctx.get("claude_binary", "claude"),
                 token_cap=ctx.get("lens_token_cap", DEFAULT_TOKEN_CAP),
                 timeout_seconds=ctx.get("lens_timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
+                env_passthrough=ctx.get("claude_env_passthrough", []),
             )
             for lens in lenses
         ),
@@ -808,6 +811,7 @@ class WorkerSettings:
             app_id:                 GitHub App numeric ID
             private_key:            PEM-encoded RSA private key
             claude_binary:          path/name of the claude CLI
+            claude_env_passthrough: extra env keys forwarded to the claude child
             lens_token_cap:         per-agent cumulative-token cap
             lens_timeout_seconds:   per-lens wall-clock timeout
             review_timeout_seconds: per-review wall-clock timeout (pipeline-wide)
@@ -827,6 +831,7 @@ class WorkerSettings:
         ctx["app_id"] = settings.github_app_id
         ctx["private_key"] = settings.github_app_private_key
         ctx["claude_binary"] = settings.claude_binary
+        ctx["claude_env_passthrough"] = settings.claude_env_passthrough
         ctx["lens_token_cap"] = settings.lens_token_cap
         ctx["lens_timeout_seconds"] = settings.lens_timeout_seconds
         ctx["review_timeout_seconds"] = settings.review_timeout_seconds

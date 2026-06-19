@@ -102,7 +102,18 @@ The `claude -p` invocation is headless with JSON output and restricts tools to t
 **Write** and **Edit** are explicitly disallowed; raw Bash carries no deny rule because an
 unscoped Bash deny would override and neuter the wrapper's allow rule — under default-deny,
 anything off the allowlist (including raw Bash) is already blocked. The subprocess is spawned
-via `create_subprocess_exec` (no shell).
+via `create_subprocess_exec` (no shell). PR code is therefore **never executed**.
+
+> **Filesystem-read confinement is incomplete.** `--add-dir` *adds* the seed workspace to the
+> allowed set; it does **not** restrict Read/Grep/Glob to it, so a prompt-injected PR can still
+> read files elsewhere on the worker by absolute path. Two interim mitigations are in place: the
+> subprocess runs with a **strict env allowlist** (only `PATH`/`HOME`/`ANTHROPIC_API_KEY` plus
+> `CLAUDE_ENV_PASSTHROUGH`, so the App private key and webhook secret are not in its environment)
+> and its **`cwd` is the workspace** (keeping default-scope Grep/Glob inside it). Neither bounds
+> absolute-path reads — a real OS-level filesystem sandbox (Landlock/bwrap/container) is the
+> proper boundary and is **not yet implemented**. Run the worker as an unprivileged user and keep
+> host secrets out of readable on-disk files (inject env directly; don't leave a `.env` in the
+> worker's cwd) until it lands.
 
 Each run is bounded by a **per-agent cumulative-token cap** (default 400k) and a **per-lens
 wall-clock timeout** (default 1800s); exceeding either kills the subprocess and drops that
@@ -334,6 +345,7 @@ or a `.env` file. Secrets must come from env/`.env` — never commit them.
 | `REDIS_URL`              | no       | `redis://localhost:6379`               | Redis connection URL for the Arq queue.                                 |
 | `DATABASE_URL`           | no       | `sqlite+aiosqlite:///./heimdall.db`    | SQLite database URL for persistence.                                    |
 | `CLAUDE_BINARY`          | no       | `claude`                               | Path or name of the `claude` CLI the lenses invoke.                     |
+| `CLAUDE_ENV_PASSTHROUGH` | no       | `[]`                                   | Extra env-var names forwarded to the `claude` child beyond the `PATH`/`HOME`/`ANTHROPIC_API_KEY` allowlist (e.g. `HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`). |
 | `LENS_TOKEN_CAP`         | no       | `400000`                               | Per-agent cumulative-token cap for a single lens run.                   |
 | `LENS_TIMEOUT_SECONDS`   | no       | `1800`                                 | Per-lens wall-clock timeout (s) before a lens subprocess is killed.     |
 | `REVIEW_TIMEOUT_SECONDS` | no       | `2400`                                 | Per-review wall-clock timeout (s) across the whole pipeline.            |

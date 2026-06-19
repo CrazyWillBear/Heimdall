@@ -20,6 +20,7 @@ from heimdall.lens import (
     LensTimeoutError,
     LensTokenCapError,
     Severity,
+    _build_subprocess_env,
     build_claude_argv,
     format_review_body,
     parse_findings,
@@ -284,7 +285,7 @@ async def test_run_lens_returns_planted_finding() -> None:
     ]
 
     async def fake_invoker(
-        argv: list[str], *, timeout_seconds: float, token_cap: int
+        argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
     ) -> ClaudeResult:
         return _claude_result(planted)
 
@@ -309,7 +310,7 @@ async def test_run_lens_passes_caps_to_invoker() -> None:
     captured: dict[str, Any] = {}
 
     async def fake_invoker(
-        argv: list[str], *, timeout_seconds: float, token_cap: int
+        argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
     ) -> ClaudeResult:
         captured["timeout"] = timeout_seconds
         captured["cap"] = token_cap
@@ -329,12 +330,76 @@ async def test_run_lens_passes_caps_to_invoker() -> None:
     assert captured["argv"][0] == "claude"
 
 
+# ---------------------------------------------------------------------------
+# Subprocess hardening: env allowlist + workspace cwd
+# ---------------------------------------------------------------------------
+
+
+def test_build_subprocess_env_strips_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The claude child env keeps the base allowlist + passthrough, drops secrets."""
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("HOME", "/home/heimdall")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY", "-----BEGIN RSA-----")
+    monkeypatch.setenv("WEBHOOK_SECRET", "hush")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy:8080")
+
+    env = _build_subprocess_env(["HTTPS_PROXY"])
+
+    assert env == {
+        "PATH": "/usr/bin",
+        "HOME": "/home/heimdall",
+        "ANTHROPIC_API_KEY": "sk-test",
+        "HTTPS_PROXY": "http://proxy:8080",
+    }
+    assert "GITHUB_APP_PRIVATE_KEY" not in env
+    assert "WEBHOOK_SECRET" not in env
+
+
+def test_build_subprocess_env_omits_absent_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Allowlisted keys missing from the parent env are simply not forwarded."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("PATH", "/usr/bin")
+    env = _build_subprocess_env(["DOES_NOT_EXIST"])
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "DOES_NOT_EXIST" not in env
+    assert env["PATH"] == "/usr/bin"
+
+
+@pytest.mark.asyncio
+async def test_run_lens_runs_claude_in_workspace_cwd() -> None:
+    """run_lens scopes the subprocess cwd to the workspace and forwards passthrough."""
+    captured: dict[str, Any] = {}
+
+    async def fake_invoker(
+        argv: list[str], *, timeout_seconds: float, token_cap: int, **kwargs: object
+    ) -> ClaudeResult:
+        captured.update(kwargs)
+        return _claude_result([])
+
+    await run_lens(
+        lens=SECURITY_LENS,
+        workspace_dir=_WORKSPACE,
+        claude_binary="claude",
+        token_cap=400_000,
+        timeout_seconds=900,
+        env_passthrough=["HTTPS_PROXY"],
+        invoker=fake_invoker,
+    )
+    assert captured["cwd"] == _WORKSPACE
+    assert captured["env_passthrough"] == ["HTTPS_PROXY"]
+
+
 @pytest.mark.asyncio
 async def test_run_lens_propagates_timeout() -> None:
     """A timeout in the invoker surfaces as LensTimeoutError (subprocess killed)."""
 
     async def timing_out_invoker(
-        argv: list[str], *, timeout_seconds: float, token_cap: int
+        argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
     ) -> ClaudeResult:
         raise LensTimeoutError("wall-clock exceeded; subprocess killed")
 
@@ -354,7 +419,7 @@ async def test_run_lens_propagates_token_cap() -> None:
     """Exceeding the token cap in the invoker surfaces as LensTokenCapError."""
 
     async def capping_invoker(
-        argv: list[str], *, timeout_seconds: float, token_cap: int
+        argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
     ) -> ClaudeResult:
         raise LensTokenCapError("token cap exceeded; subprocess killed")
 

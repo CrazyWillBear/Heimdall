@@ -155,7 +155,7 @@ async def test_run_synthesis_passes_all_lens_findings_to_claude() -> None:
     captured: dict[str, Any] = {}
 
     async def fake_invoker(
-        argv: list[str], *, timeout_seconds: float, token_cap: int
+        argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
     ) -> ClaudeResult:
         captured["prompt"] = argv[argv.index("-p") + 1]
         # Echo a single deduped survivor.
@@ -202,7 +202,7 @@ async def test_run_synthesis_returns_deduped_ranked_tagged_findings() -> None:
     }
 
     async def fake_invoker(
-        argv: list[str], *, timeout_seconds: float, token_cap: int
+        argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
     ) -> ClaudeResult:
         return ClaudeResult(stdout=json.dumps(synthesized), total_tokens=10)
 
@@ -251,7 +251,7 @@ async def test_run_synthesis_lens_tags_survive_malformed_entry() -> None:
     }
 
     async def fake_invoker(
-        argv: list[str], *, timeout_seconds: float, token_cap: int
+        argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
     ) -> ClaudeResult:
         return ClaudeResult(stdout=json.dumps(synthesized), total_tokens=10)
 
@@ -280,7 +280,7 @@ async def test_run_synthesis_verdict_reflects_dedup_survivors_only() -> None:
     }
 
     async def fake_invoker(
-        argv: list[str], *, timeout_seconds: float, token_cap: int
+        argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
     ) -> ClaudeResult:
         return ClaudeResult(stdout=json.dumps(synthesized), total_tokens=10)
 
@@ -306,7 +306,7 @@ async def test_run_synthesis_uses_synthesis_lens_spec() -> None:
     captured: dict[str, Any] = {}
 
     async def fake_invoker(
-        argv: list[str], *, timeout_seconds: float, token_cap: int
+        argv: list[str], *, timeout_seconds: float, token_cap: int, **_kwargs: object
     ) -> ClaudeResult:
         captured["argv"] = argv
         return ClaudeResult(stdout=json.dumps({"findings": []}), total_tokens=0)

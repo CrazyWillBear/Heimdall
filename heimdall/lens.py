@@ -21,6 +21,17 @@ Security posture of the invocation (see :func:`build_claude_argv`):
   * Write/Edit are explicitly disallowed; raw Bash needs no deny rule because
     default-deny already blocks anything off the allowlist, and an unscoped Bash
     deny would take precedence over (and neuter) the wrapper's allow rule.
+
+Filesystem-read confinement is **incomplete** and only partially mitigated here.
+``--add-dir`` *adds* the workspace to the allowed set; it does **not** restrict
+Read/Grep/Glob to it, so a prompt-injected PR can still read files elsewhere on the
+worker by absolute path.  The interim mitigations are: the child env is reduced to a
+strict allowlist (see :func:`run_claude_subprocess`), so the App private key and
+webhook secret are not visible to the model; and the subprocess ``cwd`` is set to the
+workspace, which keeps default-scope (no-path) Grep/Glob inside it.  Neither closes
+absolute-path reads — the real boundary is an OS-level filesystem sandbox
+(Landlock/bwrap/container restricting the read syscall to the workspace), which is NOT
+yet implemented.  PR code is still never *executed* (Bash off the allowlist is denied).
 """
 
 from __future__ import annotations
@@ -29,7 +40,8 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import Awaitable, Callable
+import os
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 
@@ -620,22 +632,50 @@ async def _kill(proc: asyncio.subprocess.Process) -> None:
         await proc.wait()
 
 
+# Env vars the claude child always needs: PATH to find node/claude, HOME for its
+# ~/.claude config, ANTHROPIC_API_KEY to authenticate.  Everything else (incl. the
+# App private key and webhook secret) is stripped so a prompt-injected PR cannot read
+# a secret out of the child's environment.
+_BASE_ENV_KEYS = ("PATH", "HOME", "ANTHROPIC_API_KEY")
+
+
+def _build_subprocess_env(passthrough: Sequence[str] = ()) -> dict[str, str]:
+    """Build a minimal env for the claude child: a strict allowlist of the parent's.
+
+    Only ``PATH``/``HOME``/``ANTHROPIC_API_KEY`` plus any caller-supplied
+    ``passthrough`` keys (e.g. ``HTTPS_PROXY``/``NODE_EXTRA_CA_CERTS`` for proxied or
+    custom-CA deployments) are forwarded; every other variable — notably
+    ``GITHUB_APP_PRIVATE_KEY`` and ``WEBHOOK_SECRET`` — is dropped.  Keys absent from
+    the parent env are simply omitted.
+    """
+    keep = [*_BASE_ENV_KEYS, *passthrough]
+    return {key: os.environ[key] for key in keep if key in os.environ}
+
+
 async def run_claude_subprocess(
     argv: list[str],
     *,
     timeout_seconds: float,
     token_cap: int,
+    cwd: str | None = None,
+    env_passthrough: Sequence[str] = (),
 ) -> ClaudeResult:
     """Default invoker: spawn claude, enforce the timeout and token cap, parse output.
 
     The subprocess is spawned with ``create_subprocess_exec`` (no shell) and is
     killed (and the failure raised) when the wall-clock timeout elapses or when
-    claude's reported cumulative usage exceeds the cap.
+    claude's reported cumulative usage exceeds the cap.  It runs with a strict
+    allowlisted env (see :func:`_build_subprocess_env`) so secrets in the worker's
+    environment are not exposed to the model, and with ``cwd`` set to the workspace so
+    default-scope Grep/Glob stay inside it (absolute-path reads are not bounded here —
+    see the module docstring).
 
     Args:
         argv: The argument vector from :func:`build_claude_argv`.
         timeout_seconds: Wall-clock limit; the process is killed past it.
         token_cap: Cumulative-token ceiling; a run reporting more is rejected.
+        cwd: Working directory for the subprocess; should be the seed workspace.
+        env_passthrough: Extra parent-env keys to forward beyond the base allowlist.
 
     Returns:
         A :class:`ClaudeResult` with stdout (claude's ``result`` text) and tokens.
@@ -648,6 +688,8 @@ async def run_claude_subprocess(
         *argv,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+        env=_build_subprocess_env(env_passthrough),
     )
     try:
         stdout_bytes, _ = await asyncio.wait_for(
@@ -684,6 +726,7 @@ async def run_lens(
     claude_binary: str = "claude",
     token_cap: int = DEFAULT_TOKEN_CAP,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    env_passthrough: Sequence[str] = (),
     invoker: ClaudeInvoker = run_claude_subprocess,
 ) -> LensResult:
     """Run one lens over a materialized seed workspace and parse its findings.
@@ -698,6 +741,7 @@ async def run_lens(
         claude_binary: Path or name of the claude executable.
         token_cap: Per-agent cumulative-token ceiling.
         timeout_seconds: Wall-clock limit for the run.
+        env_passthrough: Extra parent-env keys forwarded to the claude child.
         invoker: Coroutine that runs the subprocess; injected in tests.
 
     Returns:
@@ -713,7 +757,13 @@ async def run_lens(
         lens=lens,
     )
     logger.info("Running lens %s over %s", lens.name, workspace_dir)
-    result = await invoker(argv, timeout_seconds=timeout_seconds, token_cap=token_cap)
+    result = await invoker(
+        argv,
+        timeout_seconds=timeout_seconds,
+        token_cap=token_cap,
+        cwd=workspace_dir,
+        env_passthrough=env_passthrough,
+    )
     findings = parse_findings(result.stdout)
     logger.info(
         "Lens %s produced %d findings (%d tokens)",
@@ -731,6 +781,7 @@ async def run_synthesis(
     claude_binary: str = "claude",
     token_cap: int = DEFAULT_TOKEN_CAP,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    env_passthrough: Sequence[str] = (),
     invoker: ClaudeInvoker = run_claude_subprocess,
     blocking: frozenset[Severity] = _BLOCKING_SEVERITIES,
 ) -> SynthesisResult:
@@ -748,6 +799,7 @@ async def run_synthesis(
         claude_binary: Path or name of the claude executable.
         token_cap: Per-agent cumulative-token ceiling (bounds the synthesis call).
         timeout_seconds: Wall-clock limit for the synthesis run.
+        env_passthrough: Extra parent-env keys forwarded to the claude child.
         invoker: Coroutine that runs the subprocess; injected in tests.
         blocking: The severities that escalate the verdict to REQUEST_CHANGES;
             defaults to high/critical, overridden by the repo config threshold.
@@ -771,7 +823,13 @@ async def run_synthesis(
         len(lens_results),
         total_lens_findings,
     )
-    result = await invoker(argv, timeout_seconds=timeout_seconds, token_cap=token_cap)
+    result = await invoker(
+        argv,
+        timeout_seconds=timeout_seconds,
+        token_cap=token_cap,
+        cwd=workspace_dir,
+        env_passthrough=env_passthrough,
+    )
     tagged = parse_tagged_findings(result.stdout)
     logger.info(
         "Synthesis kept %d of %d findings (%d tokens)",
