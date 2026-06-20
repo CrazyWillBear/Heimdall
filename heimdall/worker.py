@@ -114,6 +114,14 @@ logger = logging.getLogger(__name__)
 # job around the multi-lens fanout and synthesis pass.
 DEFAULT_REVIEW_TIMEOUT_SECONDS = 2_400.0
 
+# One initial attempt + exactly one retry of the whole review pipeline.
+_MAX_REVIEW_ATTEMPTS = 2
+
+# Headroom added on top of the worst-case pipeline budget when sizing arq's job_timeout
+# (assembly, posting, retiring the prior review, GitHub round-trips outside the
+# per-review wall-clock).
+_JOB_TIMEOUT_BUFFER_SECONDS = 300.0
+
 # Posted as a COMMENT (never REQUEST_CHANGES) when both the initial run and the
 # single retry fail — a deliberately terse, metadata-free note.
 _REVIEW_FAILED_NOTE = (
@@ -577,7 +585,7 @@ async def _run_pipeline_with_retry(
     review_timeout = ctx.get(
         "review_timeout_seconds", DEFAULT_REVIEW_TIMEOUT_SECONDS
     )
-    max_attempts = 2  # one initial attempt + exactly one retry
+    max_attempts = _MAX_REVIEW_ATTEMPTS  # one initial attempt + exactly one retry
     for attempt in range(1, max_attempts + 1):
         try:
             synthesis = await asyncio.wait_for(
@@ -819,6 +827,15 @@ def main() -> None:
     if settings is None:
         settings = _load_settings()
     WorkerSettings.redis_settings = RedisSettings.from_dsn(settings.redis_url)
+    # arq's default per-job timeout (300s) is far shorter than a real review (opus/max
+    # lenses + synthesis), so it would cancel run_review mid-fanout before the pipeline's
+    # own review_timeout applies.  Size the job to outlast both attempts of the retried
+    # pipeline plus posting overhead.  Set here (not on_startup): arq reads job_timeout
+    # when it constructs the Worker, before on_startup runs.
+    WorkerSettings.job_timeout = (
+        _MAX_REVIEW_ATTEMPTS * settings.review_timeout_seconds
+        + _JOB_TIMEOUT_BUFFER_SECONDS
+    )
 
     run_worker(WorkerSettings)  # type: ignore[arg-type]
 
@@ -835,6 +852,12 @@ class WorkerSettings:
     # this attribute before on_startup runs); the localhost default keeps it a valid
     # RedisSettings instance for the ``arq heimdall.worker.WorkerSettings`` launch path.
     redis_settings: RedisSettings = RedisSettings()
+    # Per-job wall-clock ceiling arq enforces around run_review.  The default would be
+    # arq's 300s, which is shorter than a real review; main() raises it to outlast the
+    # retried pipeline (see _MAX_REVIEW_ATTEMPTS / DEFAULT_REVIEW_TIMEOUT_SECONDS).
+    job_timeout: float = (
+        _MAX_REVIEW_ATTEMPTS * DEFAULT_REVIEW_TIMEOUT_SECONDS + _JOB_TIMEOUT_BUFFER_SECONDS
+    )
 
     @staticmethod
     async def on_startup(ctx: dict[str, Any]) -> None:

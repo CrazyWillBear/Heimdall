@@ -1061,6 +1061,29 @@ def test_main_resolves_redis_settings_from_config() -> None:
     assert WorkerSettings.redis_settings.port == 6390
 
 
+def test_main_sets_job_timeout_to_cover_the_whole_retried_pipeline() -> None:
+    """main() raises arq's job_timeout above the per-review budget × retries.
+
+    arq's default job_timeout (300s) is far shorter than a real review (opus/max
+    lenses + synthesis), so it cancelled run_review mid-fanout before the pipeline's
+    own review_timeout mattered — every dogfood review died with TimeoutError.  The
+    arq job must outlast both attempts of the retried pipeline.
+    """
+    from heimdall.worker import main
+
+    with (
+        patch("arq.worker.run_worker"),
+        patch("heimdall.worker.settings") as mock_settings,
+    ):
+        mock_settings.redis_url = "redis://example-redis:6390"
+        mock_settings.review_timeout_seconds = 2_400.0
+        main()
+
+    # Both attempts of the retried pipeline (each bounded by review_timeout) must fit
+    # inside the arq job, with headroom for assembly + posting.
+    assert WorkerSettings.job_timeout > 2 * 2_400.0
+
+
 # ---------------------------------------------------------------------------
 # WorkerSettings.on_startup / on_shutdown lifecycle
 # ---------------------------------------------------------------------------
