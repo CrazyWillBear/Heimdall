@@ -142,7 +142,11 @@ async def test_subprocess_spawns_bwrap_prefixed_argv() -> None:
     assert argv[0] == _FAKE_BWRAP
     assert argv[-len(claude_argv):] == claude_argv
     assert "/srv/heimdall-lens-xyz" in _ro_bind_targets(argv)
-    assert captured["cwd"] == SANDBOX_WORKSPACE_PATH
+    # Host cwd for the bwrap process must be the real seed dir (it exists on the host).
+    # The in-sandbox cwd is /workspace, set by bwrap's --chdir flag (asserted below) —
+    # passing the in-sandbox path as the host cwd would fail every spawn with ENOENT.
+    assert captured["cwd"] == "/srv/heimdall-lens-xyz"
+    assert argv[argv.index("--chdir") + 1] == SANDBOX_WORKSPACE_PATH
 
 
 @pytest.mark.asyncio

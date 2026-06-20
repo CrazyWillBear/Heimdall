@@ -984,7 +984,11 @@ async def run_claude_subprocess(
         *argv,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        cwd=SANDBOX_WORKSPACE_PATH,
+        # Host cwd for the bwrap process: the real seed dir (it exists on the host).
+        # The *in-sandbox* cwd is /workspace, set by build_bwrap_prefix's --chdir; using
+        # the in-sandbox path here would make Python chdir to a host path that does not
+        # exist and fail every spawn with FileNotFoundError: '/workspace'.
+        cwd=cwd,
         env=_build_subprocess_env(env_passthrough),
     )
     try:
