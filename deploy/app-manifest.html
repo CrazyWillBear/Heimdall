@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Create the Heimdall GitHub App</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 16px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+    max-width: 46rem; margin: 4rem auto; padding: 0 1.25rem;
+  }
+  h1 { font-size: 1.4rem; }
+  label { display: block; margin: 1.5rem 0 .4rem; font-weight: 600; }
+  input[type=text] {
+    width: 100%; padding: .6rem .7rem; font: inherit; box-sizing: border-box;
+    border: 1px solid currentColor; border-radius: 6px; background: transparent;
+  }
+  button {
+    margin-top: 1.5rem; padding: .7rem 1.2rem; font: inherit; cursor: pointer;
+    border: 1px solid currentColor; border-radius: 6px; background: transparent;
+  }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  ol { padding-left: 1.2rem; }
+  code { padding: .1rem .3rem; border: 1px solid currentColor; border-radius: 4px; }
+  .hint { opacity: .8; font-size: .9rem; }
+</style>
+</head>
+<body>
+<h1>Create the Heimdall GitHub App</h1>
+<p>
+  One click creates a GitHub App with exactly the permissions Heimdall needs
+  (Pull requests: read &amp; write, Contents &amp; Metadata: read) subscribed to
+  <code>pull_request</code> events, with its webhook pointed at your deployment.
+</p>
+
+<label for="domain">Your Heimdall domain</label>
+<input type="text" id="domain" placeholder="heimdall.example.com" autocomplete="off">
+<p class="hint">The public host where the web service is reachable. The webhook URL
+  becomes <code>https://&lt;domain&gt;/webhook</code>.</p>
+
+<!-- GitHub's app-manifest flow: POST a `manifest` JSON field to settings/apps/new. -->
+<form id="manifest-form" method="post">
+  <input type="hidden" name="manifest" id="manifest-input">
+  <button type="submit" id="submit" disabled>Create GitHub App</button>
+</form>
+
+<h2>After you click Create</h2>
+<ol>
+  <li>GitHub creates a temporary app and redirects your browser to
+    <code>https://&lt;domain&gt;/?code=&lt;CODE&gt;</code>. A 404 page is fine —
+    copy the <code>code</code> value from the address bar.</li>
+  <li>Exchange it for the real credentials:
+    <br><code>gh api -X POST /app-manifests/&lt;CODE&gt;/conversions</code></li>
+  <li>From the JSON response: put <code>id</code> in <code>GITHUB_APP_ID</code> and
+    <code>webhook_secret</code> in <code>WEBHOOK_SECRET</code> (both in <code>.env</code>),
+    and write <code>pem</code> to
+    <code>secrets/github_app_private_key.pem</code>.</li>
+  <li>Install the App on the repositories you want reviewed.</li>
+</ol>
+
+<script>
+  const domain = document.getElementById("domain");
+  const submit = document.getElementById("submit");
+  const form = document.getElementById("manifest-form");
+  const input = document.getElementById("manifest-input");
+
+  function manifestFor(host) {
+    const base = "https://" + host;
+    return {
+      name: "Heimdall PR Reviewer",
+      url: base,
+      hook_attributes: { url: base + "/webhook", active: true },
+      redirect_url: base + "/",
+      public: false,
+      default_events: ["pull_request"],
+      default_permissions: {
+        pull_requests: "write",
+        contents: "read",
+        metadata: "read",
+      },
+    };
+  }
+
+  domain.addEventListener("input", () => {
+    submit.disabled = domain.value.trim() === "";
+  });
+
+  form.addEventListener("submit", (event) => {
+    const host = domain.value.trim();
+    if (!host) { event.preventDefault(); return; }
+    form.action = "https://github.com/settings/apps/new";
+    input.value = JSON.stringify(manifestFor(host));
+  });
+</script>
+</body>
+</html>

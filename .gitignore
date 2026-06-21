@@ -9,3 +9,10 @@ dist/
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
+# Deploy secrets / local state — never commit
+.env
+secrets/
+*.db
+
+# local dogfood override (subscription auth)
+docker-compose.override.yml

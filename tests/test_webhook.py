@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from heimdall.app import create_app
 from heimdall.config import Settings
 from heimdall.queue import ReviewJob
+from heimdall.webhook import compute_signature, verify_signature
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -68,6 +69,24 @@ def app_client() -> Iterator[tuple[TestClient, MagicMock]]:
         app = create_app(settings)
         client = TestClient(app, raise_server_exceptions=True)
         yield client, mock_enqueue
+
+
+# ---------------------------------------------------------------------------
+# Signature helpers
+# ---------------------------------------------------------------------------
+
+
+def test_compute_signature_matches_github_format() -> None:
+    """compute_signature returns the ``sha256=<hex>`` header GitHub sends."""
+    payload = b'{"hello": "world"}'
+    assert compute_signature(payload, _SECRET) == _sign(payload, _SECRET)
+
+
+def test_verify_accepts_compute_signature_output() -> None:
+    """verify_signature accepts a header produced by compute_signature (round-trip)."""
+    payload = b"some-body-bytes"
+    # Must not raise: the verify path and the signer share one implementation.
+    verify_signature(payload, _SECRET, compute_signature(payload, _SECRET))
 
 
 # ---------------------------------------------------------------------------

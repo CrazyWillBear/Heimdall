@@ -45,6 +45,11 @@ Logging is metadata-only by default — repo/PR/SHA/timing/verdict — and never
 tokens or secrets.  Findings and code text are logged only when ``debug_logging`` is
 set in ctx.
 
+At startup the worker runs a trivial bwrap exec-probe (see
+:func:`heimdall.lens.sandbox_exec_probe`) and refuses to boot if the sandbox can't
+run, so a broken sandbox is caught once at boot rather than failing every review
+closed at lens-spawn time.
+
 Launch the worker with:
     arq heimdall.worker.WorkerSettings
 """
@@ -81,6 +86,7 @@ from heimdall.diff_anchor import (
 )
 from heimdall.github import GitHubClient
 from heimdall.lens import (
+    DEFAULT_BWRAP_BINARY,
     DEFAULT_TIMEOUT_SECONDS,
     DEFAULT_TOKEN_CAP,
     LensError,
@@ -88,6 +94,7 @@ from heimdall.lens import (
     SynthesisResult,
     run_lens,
     run_synthesis,
+    sandbox_exec_probe,
 )
 from heimdall.repo_config import (
     GuardrailCaps,
@@ -106,6 +113,14 @@ logger = logging.getLogger(__name__)
 # synthesis), distinct from and looser than the per-lens timeout: it bounds the total
 # job around the multi-lens fanout and synthesis pass.
 DEFAULT_REVIEW_TIMEOUT_SECONDS = 2_400.0
+
+# One initial attempt + exactly one retry of the whole review pipeline.
+_MAX_REVIEW_ATTEMPTS = 2
+
+# Headroom added on top of the worst-case pipeline budget when sizing arq's job_timeout
+# (assembly, posting, retiring the prior review, GitHub round-trips outside the
+# per-review wall-clock).
+_JOB_TIMEOUT_BUFFER_SECONDS = 300.0
 
 # Posted as a COMMENT (never REQUEST_CHANGES) when both the initial run and the
 # single retry fail — a deliberately terse, metadata-free note.
@@ -570,7 +585,7 @@ async def _run_pipeline_with_retry(
     review_timeout = ctx.get(
         "review_timeout_seconds", DEFAULT_REVIEW_TIMEOUT_SECONDS
     )
-    max_attempts = 2  # one initial attempt + exactly one retry
+    max_attempts = _MAX_REVIEW_ATTEMPTS  # one initial attempt + exactly one retry
     for attempt in range(1, max_attempts + 1):
         try:
             synthesis = await asyncio.wait_for(
@@ -646,6 +661,7 @@ async def _synthesize_review(
             repo_full_name=repo_full_name,
             pr_number=pr_number,
             workspace_dir=workspace,
+            docs=config.docs,
         )
 
         lens_results = await _run_lenses(
@@ -663,7 +679,6 @@ async def _synthesize_review(
 
         synthesis = await run_synthesis(
             lens_results=lens_results,
-            workspace_dir=workspace,
             claude_binary=ctx.get("claude_binary", "claude"),
             token_cap=ctx.get("lens_token_cap", DEFAULT_TOKEN_CAP),
             timeout_seconds=ctx.get("lens_timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
@@ -713,6 +728,8 @@ async def _run_lenses(
                 token_cap=ctx.get("lens_token_cap", DEFAULT_TOKEN_CAP),
                 timeout_seconds=ctx.get("lens_timeout_seconds", DEFAULT_TIMEOUT_SECONDS),
                 env_passthrough=ctx.get("claude_env_passthrough", []),
+                bwrap_binary=ctx.get("bwrap_binary", DEFAULT_BWRAP_BINARY),
+                sandbox_extra_read_only_binds=ctx.get("sandbox_extra_read_only_binds", []),
             )
             for lens in lenses
         ),
@@ -798,8 +815,27 @@ def main() -> None:
 
     Invoked as ``heimdall-worker`` (see [project.scripts] in pyproject.toml)
     or directly with ``python -m heimdall.worker``.
+
+    Resolves ``WorkerSettings.redis_settings`` from the configured ``REDIS_URL`` here,
+    at process start: arq reads that class attribute when it constructs the Worker —
+    before ``on_startup`` runs — so the override must be applied now, not in on_startup
+    where it would land after the pool has already started connecting to localhost.
     """
     from arq.worker import run_worker
+
+    global settings
+    if settings is None:
+        settings = _load_settings()
+    WorkerSettings.redis_settings = RedisSettings.from_dsn(settings.redis_url)
+    # arq's default per-job timeout (300s) is far shorter than a real review (opus/max
+    # lenses + synthesis), so it would cancel run_review mid-fanout before the pipeline's
+    # own review_timeout applies.  Size the job to outlast both attempts of the retried
+    # pipeline plus posting overhead.  Set here (not on_startup): arq reads job_timeout
+    # when it constructs the Worker, before on_startup runs.
+    WorkerSettings.job_timeout = (
+        _MAX_REVIEW_ATTEMPTS * settings.review_timeout_seconds
+        + _JOB_TIMEOUT_BUFFER_SECONDS
+    )
 
     run_worker(WorkerSettings)  # type: ignore[arg-type]
 
@@ -812,22 +848,31 @@ class WorkerSettings:
     """
 
     functions = [run_review]
-    # RedisSettings is initialised from env at worker-launch time via on_startup;
-    # the default here points to localhost so the class attribute is always a
-    # valid RedisSettings instance (Arq will use it if not overridden).
+    # Overridden from the configured REDIS_URL in main() at process start (arq reads
+    # this attribute before on_startup runs); the localhost default keeps it a valid
+    # RedisSettings instance for the ``arq heimdall.worker.WorkerSettings`` launch path.
     redis_settings: RedisSettings = RedisSettings()
+    # Per-job wall-clock ceiling arq enforces around run_review.  The default would be
+    # arq's 300s, which is shorter than a real review; main() raises it to outlast the
+    # retried pipeline (see _MAX_REVIEW_ATTEMPTS / DEFAULT_REVIEW_TIMEOUT_SECONDS).
+    job_timeout: float = (
+        _MAX_REVIEW_ATTEMPTS * DEFAULT_REVIEW_TIMEOUT_SECONDS + _JOB_TIMEOUT_BUFFER_SECONDS
+    )
 
     @staticmethod
     async def on_startup(ctx: dict[str, Any]) -> None:
-        """Open the database and store app credentials in ctx.
+        """Probe the sandbox, open the database, and store app credentials in ctx.
 
-        Reads Settings from the environment, overrides redis_settings on the
-        class, then populates ctx with:
+        Reads Settings from the environment, runs a trivial bwrap exec-probe that
+        aborts startup (raising :class:`SandboxError`) on a host where the sandbox
+        cannot run, then populates ctx with:
             db:                     initialised Database instance
             app_id:                 GitHub App numeric ID
             private_key:            PEM-encoded RSA private key
             claude_binary:          path/name of the claude CLI
             claude_env_passthrough: extra env keys forwarded to the claude child
+            bwrap_binary:           path/name of the bwrap executable for the sandbox
+            sandbox_extra_read_only_binds: extra read-only host binds for the sandbox
             lens_token_cap:         per-agent cumulative-token cap
             lens_timeout_seconds:   per-lens wall-clock timeout
             review_timeout_seconds: per-review wall-clock timeout (pipeline-wide)
@@ -837,9 +882,11 @@ class WorkerSettings:
         if settings is None:
             settings = _load_settings()
 
-        # Update redis_settings from the live config so the running worker uses
-        # the correct Redis URL even if the default was overridden in .env.
-        WorkerSettings.redis_settings = RedisSettings.from_dsn(settings.redis_url)
+        # Fail fast on a host where the sandbox can't run: run a trivial bwrap
+        # exec-probe before any review work is registered.  Every lens fails closed
+        # at spawn time without a working sandbox (#26), so refuse to boot here and
+        # surface the cause immediately rather than per-review.
+        await sandbox_exec_probe(settings.bwrap_binary)
 
         db = Database(_db_path_from_url(settings.database_url))
         await db.initialize()
@@ -848,6 +895,8 @@ class WorkerSettings:
         ctx["private_key"] = settings.github_app_private_key
         ctx["claude_binary"] = settings.claude_binary
         ctx["claude_env_passthrough"] = settings.claude_env_passthrough
+        ctx["bwrap_binary"] = settings.bwrap_binary
+        ctx["sandbox_extra_read_only_binds"] = settings.sandbox_extra_read_only_binds
         ctx["lens_token_cap"] = settings.lens_token_cap
         ctx["lens_timeout_seconds"] = settings.lens_timeout_seconds
         ctx["review_timeout_seconds"] = settings.review_timeout_seconds

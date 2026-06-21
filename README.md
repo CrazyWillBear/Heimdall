@@ -80,11 +80,11 @@ private key) to read the PR and post the review.
 - `pr_metadata.json` — title, body, author, base/head refs + SHAs, linked issues
 - `files/<path>` — full content of each changed file at the head SHA (binary/oversize files
   skipped; path traversal rejected)
-- `conventions/<name>` — repo convention docs (`STYLEGUIDE.md`, `CLAUDE.md`, `README.md`)
-  when present
+- `docs/<name>` — repo docs from the configurable `docs` list (defaults:
+  `CLAUDE.md`, `README.md`, `AGENTS.md`, `STYLEGUIDE.md`) when present
 
 Each lens reads this workspace through the **`heimdall-context`** CLI wrapper — the single
-allowlisted Bash command — with subcommands `diff`, `pr`, `file <path>`, and `conventions`.
+allowlisted Bash command — with subcommands `diff`, `pr`, `file <path>`, and `docs`.
 
 ### 4. The lenses and synthesis (`heimdall/lens.py`)
 
@@ -104,16 +104,27 @@ unscoped Bash deny would override and neuter the wrapper's allow rule — under 
 anything off the allowlist (including raw Bash) is already blocked. The subprocess is spawned
 via `create_subprocess_exec` (no shell). PR code is therefore **never executed**.
 
-> **Filesystem-read confinement is incomplete.** `--add-dir` *adds* the seed workspace to the
-> allowed set; it does **not** restrict Read/Grep/Glob to it, so a prompt-injected PR can still
-> read files elsewhere on the worker by absolute path. Two interim mitigations are in place: the
-> subprocess runs with a **strict env allowlist** (only `PATH`/`HOME`/`ANTHROPIC_API_KEY` plus
-> `CLAUDE_ENV_PASSTHROUGH`, so the App private key and webhook secret are not in its environment)
-> and its **`cwd` is the workspace** (keeping default-scope Grep/Glob inside it). Neither bounds
-> absolute-path reads — a real OS-level filesystem sandbox (Landlock/bwrap/container) is the
-> proper boundary and is **not yet implemented**. Run the worker as an unprivileged user and keep
-> host secrets out of readable on-disk files (inject env directly; don't leave a `.env` in the
-> worker's cwd) until it lands.
+**Filesystem-read confinement** is enforced at the OS level by a **bubblewrap (`bwrap`) sandbox**
+wrapped around each **lens** `claude` subprocess. (The 4th **synthesis** pass runs *unsandboxed*: it
+is a no-tools, no-workspace reasoning pass over the findings JSON — no `--add-dir`, no Read/Grep/Glob,
+no `cwd` — so it can read nothing and there is nothing to confine. This is what makes it correct to
+sandbox only the three lenses.) The seed is bound **read-only**
+at the fixed in-sandbox path `/workspace` and nothing sensitive is reachable: the worker project
+dir (its `.env` / `heimdall.db`) is **never** bound in, `/tmp` is a private tmpfs, and `~/.claude`,
+the OS, CA, DNS, and `claude`/`node`/venv runtime paths are read-only. PID/IPC are unshared; the
+network is kept (`--share-net`). So even an absolute-path `Read`/`Grep`/`Glob` from a prompt-injected
+PR lands on a filesystem where no worker secret exists. The wrap is **fail-closed**: if `bwrap`
+can't be resolved or the sandbox can't be built, that lens errors and is dropped — it never runs
+unsandboxed. Configure nonstandard `claude`/`node`/CA locations via `SANDBOX_EXTRA_READ_ONLY_BINDS`
+and the `bwrap` path via `BWRAP_BINARY`. Defence in depth still holds beneath the sandbox: a
+**strict env allowlist** (only `PATH`/`HOME`/`ANTHROPIC_API_KEY` plus `CLAUDE_ENV_PASSTHROUGH`)
+keeps secrets out of the child's environment, and PR code is never *executed*.
+
+> **Requires `bwrap` on the worker host.** Install bubblewrap (it works in either setuid or
+> unprivileged-userns mode). At startup the worker runs a trivial `bwrap` **exec-probe** and
+> **refuses to boot** if the sandbox can't actually run (`bwrap` missing, unprivileged
+> userns/seccomp blocked, or setuid defeated by `--security-opt no-new-privileges`) — so the
+> failure surfaces immediately instead of every review silently failing closed at lens-spawn time.
 
 Each run is bounded by a **per-agent cumulative-token cap** (default 400k) and a **per-lens
 wall-clock timeout** (default 1800s); exceeding either kills the subprocess and drops that
@@ -195,6 +206,71 @@ uv run arq heimdall.worker.WorkerSettings
 The `heimdall-context` console script is invoked internally by the lenses; you do not run it
 by hand.
 
+### Docker deployment
+
+`docker-compose.yml` brings up the whole stack — **web** (the FastAPI service), **worker**
+(the Arq worker), **redis** (the queue), and **caddy** (TLS termination + reverse proxy). The
+shared image (`deploy/Dockerfile`) installs heimdall **non-editable** under a venv plus `bwrap`,
+Node, and the `claude` CLI, so the lens sandbox can bind the venv read-only while the worker's
+project/state dir is never exposed.
+
+**1. Create the GitHub App (manifest flow).** Open `deploy/app-manifest.html` in a browser,
+enter your domain, and click **Create GitHub App** — GitHub creates an App with exactly the
+right permissions (Pull requests: read & write; Contents & Metadata: read) subscribed to
+`pull_request`, with its webhook pointed at `https://<domain>/webhook`. GitHub then redirects to
+`https://<domain>/?code=<CODE>` (a 404 page is fine — copy the `code` from the address bar) and
+you exchange it for the credentials:
+
+```
+gh api -X POST /app-manifests/<CODE>/conversions
+```
+
+From the JSON response: put `id` in `GITHUB_APP_ID` and `webhook_secret` in `WEBHOOK_SECRET`
+(in `.env`), and write `pem` to `secrets/github_app_private_key.pem`. Install the App on the
+repos you want reviewed.
+
+**2. Configure secrets.** Copy `.env.example` to `.env` and fill in `WEBHOOK_SECRET`,
+`GITHUB_APP_ID`, `ANTHROPIC_API_KEY`, and `DOMAIN`. The App private key is a multiline PEM that
+cannot live in an env file, so it is mounted as a Compose secret — put it at
+`secrets/github_app_private_key.pem` (both `.env` and `secrets/` are gitignored).
+
+**3. Point DNS at the host.** `DOMAIN` must resolve to this machine with ports 80 and 443 open;
+Caddy obtains a certificate automatically on first start.
+
+**4. Bring it up.**
+
+```
+docker compose up -d --build
+```
+
+**Sandbox requirements (worker only).** The worker runs each lens under `bwrap` using the
+**unprivileged user-namespace** path — no setuid, no added capabilities. Docker's default
+seccomp profile blocks user-namespace creation and masks `/proc`, so the worker service runs
+with `seccomp=unconfined` and `systempaths=unconfined` (already wired in `docker-compose.yml`,
+and applied to the worker alone). The worker runs its `bwrap` exec-probe at startup and
+**refuses to boot** if the sandbox can't run, so a misconfiguration surfaces immediately. Verify
+the sandbox inside the built image with:
+
+```
+docker compose run --rm worker bwrap --ro-bind / / --unshare-all --share-net -- true
+```
+
+An exit code of 0 means the sandbox works. (Do **not** add `no-new-privileges` expecting setuid
+semantics — this deployment uses the userns path, not setuid.)
+
+**Replaying a webhook (no public tunnel).** To exercise a real review without GitHub delivering
+a webhook (e.g. a private host), `scripts/replay_webhook.py` builds and signs a `pull_request`
+payload and POSTs it to the service (published on `127.0.0.1:8000` by Compose). The App
+credentials must be for a real installed App, since the worker still fetches the PR and posts the
+review via an installation token:
+
+```
+uv run python scripts/replay_webhook.py \
+    --repo owner/repo --pr 42 --sha <head-sha> --installation-id <id>
+```
+
+(`--secret` defaults to `$WEBHOOK_SECRET`, `--url` to `http://localhost:8000/webhook`.)
+
 ## Operation
 
 Once installed and configured:
@@ -229,6 +305,12 @@ Every field below is optional and shown with its **real default**.
 
 severity_threshold: high          # lowest severity that blocks (REQUEST_CHANGES);
                                   # below it findings only comment. Default: high.
+
+docs:                             # repo-relative doc paths fed into every PR seed.
+  - CLAUDE.md                     # setting `docs` FULLY REPLACES this default list;
+  - README.md                     # `docs: []` means no docs; an absent field uses
+  - AGENTS.md                     # these four. No globbing; absolute/`..` paths are
+  - STYLEGUIDE.md                 # rejected at load. Default: the four shown here.
 
 lenses:                           # per-lens overrides, keyed by built-in lens name.
   security:                       # built-in: opus / max
@@ -277,6 +359,7 @@ caps:                             # guardrail caps; every field has a SAFE, non-
 | `severity_threshold` | `critical`/`high`/`medium`/`low` | `high` | Lowest severity that blocks (REQUEST_CHANGES); below it comments. |
 | `scope`              | scope filters              | all defaults | Whether the PR is reviewed at all.                             |
 | `caps`               | guardrail caps             | all defaults | Resource ceilings on review work.                             |
+| `docs`               | list of repo-relative paths | `[CLAUDE.md, README.md, AGENTS.md, STYLEGUIDE.md]` | Docs fed into every PR seed; setting it **fully replaces** the defaults, `[]` means none. Contents come from the PR head; the list from the trusted config. No globbing; absolute/`..` entries rejected at load. |
 
 **Per-lens override (`lenses.<security|design|cleanliness>`, `LensConfig`)** — overrides a
 built-in lens. `instructions` is **appended** to the built-in system prompt (the lens keeps its
@@ -346,6 +429,8 @@ or a `.env` file. Secrets must come from env/`.env` — never commit them.
 | `DATABASE_URL`           | no       | `sqlite+aiosqlite:///./heimdall.db`    | SQLite database URL for persistence.                                    |
 | `CLAUDE_BINARY`          | no       | `claude`                               | Path or name of the `claude` CLI the lenses invoke.                     |
 | `CLAUDE_ENV_PASSTHROUGH` | no       | `[]`                                   | Extra env-var names forwarded to the `claude` child beyond the `PATH`/`HOME`/`ANTHROPIC_API_KEY` allowlist (e.g. `HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`). |
+| `BWRAP_BINARY`           | no       | `bwrap`                                | Path or name of the bubblewrap (`bwrap`) executable used to sandbox each lens `claude` subprocess; resolved on `PATH` unless an absolute path is given. |
+| `SANDBOX_EXTRA_READ_ONLY_BINDS` | no | `[]`                                  | Extra host paths bound **read-only** into the lens sandbox, for nonstandard `claude`/`node`/CA installs. The seed, OS, CA, DNS, `~/.claude`, and venv are bound automatically; the worker project dir is **never** bound. |
 | `LENS_TOKEN_CAP`         | no       | `400000`                               | Per-agent cumulative-token cap for a single lens run.                   |
 | `LENS_TIMEOUT_SECONDS`   | no       | `1800`                                 | Per-lens wall-clock timeout (s) before a lens subprocess is killed.     |
 | `REVIEW_TIMEOUT_SECONDS` | no       | `2400`                                 | Per-review wall-clock timeout (s) across the whole pipeline.            |

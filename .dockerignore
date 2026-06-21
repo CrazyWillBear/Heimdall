@@ -1,0 +1,19 @@
+# Keep the build context small and secrets/state out of the image.
+.git
+.gitignore
+.venv
+.worktrees
+.mypy_cache
+.ruff_cache
+.pytest_cache
+__pycache__
+*.pyc
+# Never ship local secrets or state into the image.
+.env
+secrets/
+*.db
+# Dev-only; the wheel is scoped to the heimdall package.
+tests/
+scripts/
+deploy/Caddyfile
+deploy/app-manifest.html

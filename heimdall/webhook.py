@@ -24,6 +24,23 @@ router = APIRouter()
 _RELEVANT_ACTIONS = frozenset({"opened", "reopened", "synchronize", "ready_for_review"})
 
 
+def compute_signature(payload: bytes, secret: str) -> str:
+    """Return the ``sha256=<hex>`` HMAC header GitHub puts in ``X-Hub-Signature-256``.
+
+    The single source of truth for the webhook HMAC: :func:`verify_signature` checks
+    against it and the replay helper signs with it, so the verify and sign paths can
+    never drift.
+
+    Args:
+        payload: The raw request body bytes.
+        secret: The webhook secret configured on the GitHub App.
+
+    Returns:
+        The signature header value, ``sha256=`` followed by the hex HMAC-SHA256 digest.
+    """
+    return "sha256=" + hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+
+
 def verify_signature(payload: bytes, secret: str, signature_header: str | None) -> None:
     """Raise HTTP 401 if the webhook signature is absent or invalid.
 
@@ -40,7 +57,7 @@ def verify_signature(payload: bytes, secret: str, signature_header: str | None) 
     """
     if not signature_header or not signature_header.startswith("sha256="):
         raise HTTPException(status_code=401, detail="Missing webhook signature")
-    expected = "sha256=" + hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+    expected = compute_signature(payload, secret)
     if not hmac.compare_digest(expected, signature_header):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
 

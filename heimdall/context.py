@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 
 from heimdall.github import GitHubClient
+from heimdall.repo_config import _DEFAULT_DOCS
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ class PRContext:
         diff: Unified diff of all changes.
         changed_files: List of file-change objects from the GitHub API.
         file_contents: Map from file path to full decoded file content at head_sha.
-        convention_docs: Map from doc name to text (e.g. STYLEGUIDE.md content).
+        docs: Map from doc name to text (e.g. STYLEGUIDE.md content).
     """
 
     repo_full_name: str
@@ -60,7 +61,7 @@ class PRContext:
     diff: str
     changed_files: list[dict[str, Any]]
     file_contents: dict[str, str]
-    convention_docs: dict[str, str]
+    docs: dict[str, str]
 
 
 async def assemble_pr_context(
@@ -71,6 +72,7 @@ async def assemble_pr_context(
     repo_full_name: str,
     pr_number: int,
     workspace_dir: str | None = None,
+    docs: list[str] | None = None,
 ) -> PRContext:
     """Assemble the seed context for a pull request.
 
@@ -90,10 +92,15 @@ async def assemble_pr_context(
         repo_full_name: e.g. "owner/repo".
         pr_number: The pull-request number.
         workspace_dir: Optional caller-managed directory to materialize into.
+        docs: Repo-relative doc paths to fetch from the PR head (tolerate-missing).
+            ``None`` uses the four built-in defaults; ``[]`` fetches no docs.  The
+            worker passes the loaded ``config.docs`` (validated, from the trusted
+            ref) so the list is trusted even though contents come from the head.
 
     Returns:
         The assembled PRContext with all seed fields populated.
     """
+    doc_names = list(_DEFAULT_DOCS) if docs is None else docs
     github = GitHubClient(
         app_id=app_id,
         private_key=private_key,
@@ -104,11 +111,12 @@ async def assemble_pr_context(
             github, repo_full_name=repo_full_name, pr_number=pr_number
         )
         head_sha = pr_meta["head"]["sha"]
-        file_contents, convention_docs = await _fetch_file_contents_and_conventions(
+        file_contents, fetched_docs = await _fetch_file_contents_and_docs(
             github,
             repo_full_name=repo_full_name,
             files=files,
             ref=head_sha,
+            doc_names=doc_names,
         )
     finally:
         await github.aclose()
@@ -127,7 +135,7 @@ async def assemble_pr_context(
         diff=diff,
         changed_files=files,
         file_contents=file_contents,
-        convention_docs=convention_docs,
+        docs=fetched_docs,
     )
 
     if workspace_dir is not None:
@@ -174,33 +182,32 @@ async def _fetch_pr_data(
     return pr_meta, diff, files, linked
 
 
-_CONVENTION_DOC_NAMES = ("STYLEGUIDE.md", "CLAUDE.md", "README.md")
-
-
-async def _fetch_file_contents_and_conventions(
+async def _fetch_file_contents_and_docs(
     github: GitHubClient,
     *,
     repo_full_name: str,
     files: list[dict[str, Any]],
     ref: str,
+    doc_names: list[str],
 ) -> tuple[dict[str, str], dict[str, str]]:
-    """Fetch changed-file contents and repo convention docs in parallel.
+    """Fetch changed-file contents and repo docs in parallel.
 
     Changed files with status "removed" are skipped.  Per-file failures for
     changed files are isolated: binary files (UnicodeDecodeError) and
     oversize/unavailable files (HTTPStatusError) are logged and omitted rather
-    than aborting the whole gather.  Convention docs absent from the repo are
-    silently omitted (404 is tolerated via ``tolerate_missing``).
+    than aborting the whole gather.  Docs absent from the repo are silently
+    omitted (404 is tolerated via ``tolerate_missing``).
 
     Args:
         github: Authenticated GitHub API client.
         repo_full_name: e.g. "owner/repo".
         files: Changed-file objects from the PR files API.
         ref: Git ref (commit SHA) to read from.
+        doc_names: Repo-relative doc paths to fetch (the validated config list).
 
     Returns:
-        A ``(file_contents, convention_docs)`` tuple where each value maps
-        a path/name to the decoded file content, with unreadable files omitted.
+        A ``(file_contents, docs)`` tuple where each value maps a path/name to
+        the decoded file content, with unreadable files omitted.
     """
     import asyncio
 
@@ -214,7 +221,7 @@ async def _fetch_file_contents_and_conventions(
         )
         return filename, content
 
-    async def _fetch_convention(name: str) -> tuple[str, str | None]:
+    async def _fetch_doc(name: str) -> tuple[str, str | None]:
         content = await github.get_file_content(
             repo_full_name=repo_full_name,
             path=name,
@@ -225,19 +232,19 @@ async def _fetch_file_contents_and_conventions(
 
     n_changed = len(fetchable)
     changed_tasks = [_fetch_changed(f["filename"]) for f in fetchable]
-    convention_tasks = [_fetch_convention(name) for name in _CONVENTION_DOC_NAMES]
+    doc_tasks = [_fetch_doc(name) for name in doc_names]
 
     # Gather all tasks in one shot. return_exceptions=True isolates per-file
     # errors in the changed-file slice so one bad file cannot abort the whole
-    # gather; convention tasks handle missing-file 404s via tolerate_missing.
+    # gather; doc tasks handle missing-file 404s via tolerate_missing.
     all_results: list[tuple[str, str | None] | BaseException] = await asyncio.gather(
         *changed_tasks,
-        *convention_tasks,
+        *doc_tasks,
         return_exceptions=True,
     )
 
     changed_raw = all_results[:n_changed]
-    convention_raw = all_results[n_changed:]
+    doc_raw = all_results[n_changed:]
 
     file_contents: dict[str, str] = {}
     for item in changed_raw:
@@ -261,15 +268,15 @@ async def _fetch_file_contents_and_conventions(
             if content is not None:
                 file_contents[filename] = content
 
-    convention_docs: dict[str, str] = {}
-    for item in convention_raw:
+    docs: dict[str, str] = {}
+    for item in doc_raw:
         if isinstance(item, BaseException):
             raise item
         name, content = item
         if content is not None:
-            convention_docs[name] = content
+            docs[name] = content
 
-    return file_contents, convention_docs
+    return file_contents, docs
 
 
 def _safe_file_path(files_root: Path, filename: str) -> Path | None:
@@ -315,7 +322,7 @@ def _materialize(ctx: PRContext, directory: str) -> None:
       <directory>/diff.patch               — unified diff
       <directory>/pr_metadata.json         — PR metadata as JSON
       <directory>/files/<path>             — full content of each changed file
-      <directory>/conventions/<name>       — repo convention docs (if any)
+      <directory>/docs/<name>              — repo docs (if any)
     """
     root = Path(directory)
 
@@ -347,13 +354,14 @@ def _materialize(ctx: PRContext, directory: str) -> None:
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
 
-    if ctx.convention_docs:
-        conventions_root = root / "conventions"
-        conventions_root.mkdir(exist_ok=True)
-        for name, content in ctx.convention_docs.items():
-            # The names are a trusted hardcoded set today, but route through the same
-            # guard as files/ so a future dynamic source can't escape the workspace.
-            doc_path = _safe_file_path(conventions_root, name)
+    if ctx.docs:
+        docs_root = root / "docs"
+        docs_root.mkdir(exist_ok=True)
+        for name, content in ctx.docs.items():
+            # Doc names come from the trusted config list (already rejected at load for
+            # absolute/.. entries), but route through the same guard as files/ as
+            # defense in depth so nothing can escape the workspace.
+            doc_path = _safe_file_path(docs_root, name)
             if doc_path is None:
                 continue
             doc_path.parent.mkdir(parents=True, exist_ok=True)
