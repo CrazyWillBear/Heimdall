@@ -1,11 +1,14 @@
-<p align="center">
+<div align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/heimdall-emblem-dark.png">
     <img src="docs/assets/heimdall-emblem.png" alt="Heimdall" width="420">
   </picture>
-</p>
-
-# Heimdall
+  <br><br>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/heimdall-wordmark-dark.svg">
+    <img src="docs/assets/heimdall-wordmark.svg" alt="HEIMDALL" width="400">
+  </picture>
+</div>
 
 Heimdall is a self-hosted GitHub App that automatically reviews pull requests with a
 Claude-driven, multi-lens review engine. When a PR is opened or updated it fans out three
