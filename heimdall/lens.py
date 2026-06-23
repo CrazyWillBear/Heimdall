@@ -187,6 +187,9 @@ class SynthesisResult:
             comment or a resolved thread settled them (title + brief reason each).  Kept
             separate from the survivors so downstream rendering can surface what was
             dropped and why (#66); empty when nothing was suppressed.
+        comments_truncated: True when the PR's comment set exceeded the cap and
+            lower-priority comments were omitted from the seed.  Surfaced in the posted
+            body so the reader knows some comments were dropped.
     """
 
     tagged_findings: list[TaggedFinding]
@@ -194,6 +197,7 @@ class SynthesisResult:
     body: str
     dropped_lenses: tuple[str, ...] = ()
     suppressed_findings: tuple[SuppressedFinding, ...] = ()
+    comments_truncated: bool = False
 
 
 @dataclass
@@ -671,6 +675,21 @@ def render_dropped_lenses_warning(dropped: Sequence[str]) -> str:
         f"> ⚠️ {len(dropped)} review {'lens' if one else 'lenses'} failed to run and "
         f"{'was' if one else 'were'} skipped: {names}. This review does not cover "
         f"{'that lens' if one else 'those lenses'}."
+    )
+
+
+def render_comments_truncated_note(truncated: bool) -> str:
+    """Render a banner noting some PR comments were omitted, empty when none.
+
+    Mirrors :func:`render_dropped_lenses_warning`: when the PR's comment set exceeded
+    the cap, only the top-priority comments fed this review, so the reader is told some
+    were dropped — otherwise the review would silently weigh a partial discussion.
+    """
+    if not truncated:
+        return ""
+    return (
+        "> ℹ️ This PR has more comments than Heimdall includes per review; "
+        "lower-priority comments were omitted from the context for this review."
     )
 
 _SEVERITY_HEADERS = (
@@ -1431,6 +1450,7 @@ async def run_synthesis(
     review_threads: list[dict[str, Any]] | None = None,
     review_summaries: list[dict[str, Any]] | None = None,
     own_prior_review: dict[str, Any] | None = None,
+    comments_truncated: bool = False,
     claude_binary: str = "claude",
     token_cap: int = DEFAULT_TOKEN_CAP,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
@@ -1479,6 +1499,9 @@ async def run_synthesis(
         own_prior_review: Heimdall's own prior review to embed as untrusted continuity
             context; has ``body``, ``author``, ``author_association``, ``event``, and an
             ``inline_comments`` list.  None embeds none.
+        comments_truncated: True when the PR's comment set exceeded the cap and
+            lower-priority comments were omitted from the seed; carried onto the result
+            so the posted body can note that some comments were dropped.
         claude_binary: Path or name of the claude executable.
         token_cap: Per-agent cumulative-token ceiling (bounds the synthesis call).
         timeout_seconds: Wall-clock limit for the synthesis run.
@@ -1550,4 +1573,5 @@ async def run_synthesis(
         verdict=verdict_for_tagged(tagged, blocking=blocking),
         body=format_synthesis_body(tagged),
         suppressed_findings=suppressed,
+        comments_truncated=comments_truncated,
     )
