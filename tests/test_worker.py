@@ -12,6 +12,7 @@ import pytest
 from heimdall.lens import (
     Finding,
     LensError,
+    LensOutputError,
     LensResult,
     LensTimeoutError,
     SandboxError,
@@ -20,7 +21,12 @@ from heimdall.lens import (
     TaggedFinding,
 )
 from heimdall.repo_config import LensConfig, RepoConfig, ScopeFilters
-from heimdall.worker import WorkerSettings, _configure_logging, run_review
+from heimdall.worker import (
+    _REVIEW_FAILED_NOTE,
+    WorkerSettings,
+    _configure_logging,
+    run_review,
+)
 
 _REPO = "owner/repo"
 _PR = 3
@@ -543,6 +549,72 @@ async def test_run_review_handles_synthesis_failure_without_crashing() -> None:
     mock_set.assert_awaited_once()
     mock_persist.assert_not_called()
     mock_gh_client.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_lens_output_error_posts_failure_note_not_clean_review() -> None:
+    """PR #82 regression: a lens that produced no usable output (LensOutputError)
+    must post the failure note, never a green 'no concerns' review."""
+    mock_gh_client = _gh_client()
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    stack, synth_mock = _patch_review_pipeline(
+        lens_side_effect=LensOutputError("0 tokens; failed run, not a clean review")
+    )
+    with (
+        stack,
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    synth_mock.assert_not_called()
+    mock_gh_client.post_review.assert_awaited_once()
+    assert mock_gh_client.post_review.await_args.kwargs["body"] == _REVIEW_FAILED_NOTE
+    assert mock_gh_client.post_review.await_args.kwargs["event"] == "COMMENT"
+
+
+@pytest.mark.asyncio
+async def test_synthesis_output_error_posts_failure_note_not_clean_review() -> None:
+    """A synthesis pass that produced no usable output (LensOutputError) posts the
+    failure note — synthesis builds the posted body, so this is the critical guard."""
+    mock_gh_client = _gh_client()
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    lens_results = [
+        _lens_result([], name="security"),
+        _lens_result([], name="design"),
+        _lens_result([], name="cleanliness"),
+    ]
+    # The retry re-runs the lenses, so feed enough results for two attempts.
+    stack, _ = _patch_review_pipeline(
+        lens_results=lens_results * 2,
+        synthesis_side_effect=LensOutputError("no parseable findings JSON"),
+    )
+    with (
+        stack,
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()),
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    mock_gh_client.post_review.assert_awaited_once()
+    assert mock_gh_client.post_review.await_args.kwargs["body"] == _REVIEW_FAILED_NOTE
+    assert mock_gh_client.post_review.await_args.kwargs["event"] == "COMMENT"
 
 
 # ---------------------------------------------------------------------------
