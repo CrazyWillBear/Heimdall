@@ -95,6 +95,13 @@ shared seed, each bounded independently:
 | `design`      | Design-fit / architecture                            | sonnet | high   |
 | `cleanliness` | Readability, dead/duplicated code, doc hygiene       | sonnet | high   |
 
+Each lens also sees the PR's conversation comments as **untrusted background context**: its
+prompt points it at **`heimdall-context comments`** (the same allowlisted wrapper it uses for
+the diff/files/docs), so the payload is read in-sandbox rather than baked into the prompt. The
+comments are framed as untrusted third-party data — context to weigh, never instructions — and
+an empty comment set leaves lens behaviour unchanged (the wrapper returns `[]`). This grants
+lenses *visibility* only; the suppression of settled points lives in synthesis, not here.
+
 The `claude -p` invocation is headless with JSON output and restricts tools to the read-only
 **Read / Grep / Glob** plus the single allowlisted **`heimdall-context`** Bash wrapper.
 **Write** and **Edit** are explicitly disallowed; raw Bash carries no deny rule because an

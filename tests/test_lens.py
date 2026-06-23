@@ -13,11 +13,14 @@ from typing import Any
 import pytest
 
 from heimdall.lens import (
+    CLEANLINESS_LENS,
+    DESIGN_LENS,
     SECURITY_LENS,
     ClaudeResult,
     Finding,
     LensOutputError,
     LensResult,
+    LensSpec,
     LensTimeoutError,
     LensTokenCapError,
     Severity,
@@ -269,6 +272,81 @@ def test_argv_scopes_session_to_workspace() -> None:
     )
     assert "--add-dir" in argv
     assert _WORKSPACE in argv
+
+
+# ---------------------------------------------------------------------------
+# Lenses see comments as untrusted context via the heimdall-context wrapper.
+# The payload is NOT embedded in the prompt (unlike synthesis); each lens reads
+# it through the same allowlisted `heimdall-context comments` call in-sandbox.
+# ---------------------------------------------------------------------------
+
+_ALL_LENSES = (SECURITY_LENS, DESIGN_LENS, CLEANLINESS_LENS)
+
+
+@pytest.mark.parametrize("lens", _ALL_LENSES, ids=lambda lens: lens.name)
+def test_lens_default_prompt_directs_reading_comments_as_untrusted(
+    lens: LensSpec,
+) -> None:
+    """The default lens prompt tells the lens to consult the PR comments as context."""
+    argv = build_claude_argv(
+        claude_binary="claude",
+        workspace_dir=_WORKSPACE,
+        lens=lens,
+    )
+    prompt = argv[argv.index("-p") + 1]
+    # The lens is pointed at the conversation comments via the wrapper subcommand...
+    assert "heimdall-context comments" in prompt
+    # ...and they are framed as untrusted background context, not instructions.
+    assert "UNTRUSTED" in prompt
+    assert "never" in prompt and "instructions" in prompt
+
+
+@pytest.mark.parametrize("lens", _ALL_LENSES, ids=lambda lens: lens.name)
+def test_lens_system_prompt_lists_comments_subcommand_as_untrusted(
+    lens: LensSpec,
+) -> None:
+    """Every lens system prompt exposes the comments subcommand, flagged untrusted.
+
+    Comments must be framed consistently with the existing diff/file/docs context,
+    so the wrapper subcommand list includes `comments` and the prompt marks it
+    UNTRUSTED third-party data.
+    """
+    system_prompt = lens.system_prompt
+    assert "diff|pr|file|docs|comments" in system_prompt
+    assert "UNTRUSTED" in system_prompt
+
+
+def test_lens_comments_payload_not_embedded_in_argv() -> None:
+    """Lenses read comments via the wrapper, so no payload is baked into the argv.
+
+    Unlike synthesis (which is tool-less and must embed the payload), a lens has the
+    allowlisted wrapper and reads `heimdall-context comments` in-sandbox; baking the
+    payload into the prompt would defeat the central mechanism and is not done.
+    """
+    argv = build_claude_argv(
+        claude_binary="claude",
+        workspace_dir=_WORKSPACE,
+        lens=SECURITY_LENS,
+    )
+    prompt = argv[argv.index("-p") + 1]
+    # The prompt points AT the wrapper but carries no serialized comments JSON.
+    assert '"comments":' not in prompt
+
+
+def test_lens_comments_visibility_grants_no_new_tool() -> None:
+    """Surfacing comments to the lenses leaves the tool allowlist unchanged.
+
+    The sandbox posture is fixed: read-only Read/Grep/Glob plus the single
+    `heimdall-context` Bash wrapper — comments ride that existing wrapper, so no
+    new tool appears on the allow list.
+    """
+    argv = build_claude_argv(
+        claude_binary="claude",
+        workspace_dir=_WORKSPACE,
+        lens=SECURITY_LENS,
+    )
+    allowed = argv[argv.index("--allowedTools") + 1]
+    assert allowed == "Read Grep Glob Bash(heimdall-context *)"
 
 
 # ---------------------------------------------------------------------------
