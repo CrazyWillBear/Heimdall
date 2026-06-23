@@ -104,6 +104,7 @@ from heimdall.lens import (
     SynthesisResult,
     render_comments_truncated_note,
     render_dropped_lenses_warning,
+    render_suppressed_findings_section,
     run_lens,
     run_synthesis,
     sandbox_exec_probe,
@@ -563,11 +564,13 @@ async def _build_inline_split(
     commentable = commentable_lines(diff)
     inline, body_findings = split_findings(synthesis.tagged_findings, commentable)
     body = render_body_for_offdiff(body_findings)
-    # Mirror the dropped-lenses banner: prepend any guardrail notes so the reader sees
-    # what this review did NOT cover before the findings themselves.
+    # Mirror the dropped-lenses banner: prepend any guardrail notes (and the
+    # suppressed-findings section) so the reader sees what this review did NOT cover —
+    # and which findings Heimdall judged settled — before the findings themselves.
     for note in (
         render_dropped_lenses_warning(synthesis.dropped_lenses),
         render_comments_truncated_note(synthesis.comments_truncated),
+        render_suppressed_findings_section(synthesis.suppressed_findings),
     ):
         if note:
             body = f"{note}\n\n{body}"

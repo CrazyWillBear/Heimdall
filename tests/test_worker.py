@@ -18,6 +18,7 @@ from heimdall.lens import (
     LensTimeoutError,
     SandboxError,
     Severity,
+    SuppressedFinding,
     SynthesisResult,
     TaggedFinding,
 )
@@ -910,6 +911,74 @@ async def test_build_inline_split_no_note_when_not_truncated() -> None:
     )
 
     assert "omitted" not in body
+
+
+@pytest.mark.asyncio
+async def test_build_inline_split_surfaces_suppressed_findings_in_body() -> None:
+    """Suppressed findings surface a labeled title+reason section in the posted body (#66)."""
+    from heimdall.worker import _build_inline_split
+
+    mock_gh_client = _gh_client()
+    synthesis = _synthesis_from([_tagged(Severity.LOW, "cleanliness", "nit")])
+    synthesis = replace(
+        synthesis,
+        suppressed_findings=(
+            SuppressedFinding(title="Auth bypass", reason="OWNER marked intentional"),
+        ),
+    )
+
+    body, _ = await _build_inline_split(
+        mock_gh_client, synthesis, repo_full_name=_REPO, pr_number=_PR
+    )
+
+    # The suppressed finding's title + reason are surfaced, clearly labeled.
+    assert "Auth bypass" in body
+    assert "OWNER marked intentional" in body
+    assert "suppressed" in body.lower()
+    # It coexists with the existing findings body without clobbering it.
+    assert "nit" in body
+
+
+@pytest.mark.asyncio
+async def test_build_inline_split_no_suppressed_section_when_none() -> None:
+    """Nothing suppressed leaves no suppressed-findings section in the body (#66)."""
+    from heimdall.worker import _build_inline_split
+
+    mock_gh_client = _gh_client()
+    synthesis = _synthesis_from([])
+
+    body, _ = await _build_inline_split(
+        mock_gh_client, synthesis, repo_full_name=_REPO, pr_number=_PR
+    )
+
+    assert "suppressed" not in body.lower()
+
+
+@pytest.mark.asyncio
+async def test_build_inline_split_suppressed_section_coexists_with_dropped_lens() -> None:
+    """The suppressed section and the dropped-lens banner both appear, neither clobbered."""
+    from heimdall.worker import _build_inline_split
+
+    mock_gh_client = _gh_client()
+    synthesis = _synthesis_from([_tagged(Severity.LOW, "cleanliness", "nit")])
+    synthesis = replace(
+        synthesis,
+        dropped_lenses=("security",),
+        suppressed_findings=(
+            SuppressedFinding(title="SQL injection", reason="resolved thread"),
+        ),
+    )
+
+    body, _ = await _build_inline_split(
+        mock_gh_client, synthesis, repo_full_name=_REPO, pr_number=_PR
+    )
+
+    # Dropped-lens banner, suppressed section, and findings body all survive together.
+    assert "security" in body
+    assert "skipped" in body.lower()
+    assert "SQL injection" in body
+    assert "resolved thread" in body
+    assert "nit" in body
 
 
 # ---------------------------------------------------------------------------

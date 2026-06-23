@@ -181,9 +181,12 @@ finding's inline thread being **resolved** (`is_resolved`). A **CONTRIBUTOR / NO
 context only and **never** suppresses via its text, so a prompt-injected "approve anyway" from an
 outside account cannot silence a finding. The per-comment `author_association` and per-thread
 `is_resolved` ride in the prompt; the drop decision is the model's judgment. Synthesis returns the
-dropped findings (title + brief reason) in `suppressed_findings`, **separate** from the survivors,
-so downstream rendering can surface what was dropped and why. The **verdict is computed from the
-survivors alone**, so suppressing a blocking finding can downgrade `REQUEST_CHANGES` to `COMMENT`.
+dropped findings (title + brief reason) in `suppressed_findings`, **separate** from the survivors.
+The posted review body then carries a labeled **suppressed-findings section** (each dropped
+finding's title + reason), mirroring the dropped-lens banner / comment-omission note posture, so a
+maintainer sees Heimdall made a judgment rather than silently omitting something. The **verdict is
+computed from the survivors alone**, so suppressing a blocking finding can downgrade
+`REQUEST_CHANGES` to `COMMENT`.
 
 **Verdict.** Each finding carries a `Severity` (critical / high / medium / low). Any surviving
 finding whose severity meets the repo's **blocking threshold** maps the review to

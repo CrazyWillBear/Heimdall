@@ -692,6 +692,30 @@ def render_comments_truncated_note(truncated: bool) -> str:
         "lower-priority comments were omitted from the context for this review."
     )
 
+
+def render_suppressed_findings_section(
+    suppressed: Sequence[SuppressedFinding],
+) -> str:
+    """Render a section listing findings synthesis dropped, empty string when none.
+
+    Mirrors :func:`render_dropped_lenses_warning` / :func:`render_comments_truncated_note`:
+    when synthesis authoritatively settled a finding (a maintainer comment or a resolved
+    thread, see :data:`_SYNTHESIS_SYSTEM_PROMPT`), it is dropped from the surviving set
+    that drives the verdict — but never silently.  This section names each dropped
+    finding's title and brief reason so a maintainer can see Heimdall made a judgment
+    rather than omitting something.  Empty when nothing was suppressed (no noise section).
+    """
+    if not suppressed:
+        return ""
+    one = len(suppressed) == 1
+    lines = [
+        f"> 🔕 Heimdall suppressed {len(suppressed)} finding{'' if one else 's'} the PR "
+        "discussion authoritatively settled (verdict reflects the surviving set):"
+    ]
+    lines += [f"> - **{item.title}** — {item.reason}" for item in suppressed]
+    return "\n".join(lines)
+
+
 _SEVERITY_HEADERS = (
     (Severity.CRITICAL, "Critical"),
     (Severity.HIGH, "High"),

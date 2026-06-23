@@ -24,6 +24,7 @@ from heimdall.lens import (
     LensTimeoutError,
     LensTokenCapError,
     Severity,
+    SuppressedFinding,
     SynthesisResult,
     _build_subprocess_env,
     build_claude_argv,
@@ -31,6 +32,7 @@ from heimdall.lens import (
     parse_findings,
     render_comments_truncated_note,
     render_dropped_lenses_warning,
+    render_suppressed_findings_section,
     run_lens,
     run_synthesis,
     verdict_for,
@@ -670,3 +672,31 @@ def test_render_comments_truncated_note_present_when_truncated() -> None:
     note = render_comments_truncated_note(True)
     assert note != ""
     assert "omitted" in note
+
+
+# ---------------------------------------------------------------------------
+# Suppressed-findings section (synthesis-judgment surfacing, #66)
+# ---------------------------------------------------------------------------
+
+
+def test_render_suppressed_findings_section_empty_when_none() -> None:
+    assert render_suppressed_findings_section(()) == ""
+
+
+def test_render_suppressed_findings_section_lists_title_and_reason() -> None:
+    section = render_suppressed_findings_section(
+        (
+            SuppressedFinding(title="SQL injection", reason="resolved thread"),
+            SuppressedFinding(
+                title="XSS", reason="maintainer marked intentional"
+            ),
+        )
+    )
+    assert section != ""
+    # Each suppressed finding's title and reason is surfaced.
+    assert "SQL injection" in section
+    assert "resolved thread" in section
+    assert "XSS" in section
+    assert "maintainer marked intentional" in section
+    # Clearly labeled so a maintainer sees Heimdall made a judgment.
+    assert "suppressed" in section.lower()
