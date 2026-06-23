@@ -164,6 +164,17 @@ runs **inside the `bwrap` sandbox** (over a throwaway empty workspace, `~/.claud
 read-only), so no `claude` pass is ever spawned unsandboxed. When every lens fails or synthesis
 itself aborts, that run produces no review (the retry/failure handling above takes over).
 
+**Suppression contract.** Synthesis is the single point that may **drop a finding** the
+discussion authoritatively settled. *Authoritative* is narrow: **either** the text of a comment /
+thread / summary whose `author_association` is **OWNER / MEMBER / COLLABORATOR**, **or** the
+finding's inline thread being **resolved** (`is_resolved`). A **CONTRIBUTOR / NONE** comment is
+context only and **never** suppresses via its text, so a prompt-injected "approve anyway" from an
+outside account cannot silence a finding. The per-comment `author_association` and per-thread
+`is_resolved` ride in the prompt; the drop decision is the model's judgment. Synthesis returns the
+dropped findings (title + brief reason) in `suppressed_findings`, **separate** from the survivors,
+so downstream rendering can surface what was dropped and why. The **verdict is computed from the
+survivors alone**, so suppressing a blocking finding can downgrade `REQUEST_CHANGES` to `COMMENT`.
+
 **Verdict.** Each finding carries a `Severity` (critical / high / medium / low). Any surviving
 finding whose severity meets the repo's **blocking threshold** maps the review to
 **REQUEST_CHANGES**; otherwise the review is a **COMMENT**. The default threshold is `high`,
