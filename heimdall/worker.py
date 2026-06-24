@@ -19,8 +19,10 @@ has not opted in, so nothing is reviewed — then applies scope filters (base-br
 allowlist, path globs, skip drafts/bot authors, opt-out label) and the guardrail caps:
 a PR over the diff-size/file-count cap is skipped WITH a posted note, a repo over its
 per-window review budget is skipped silently, and a review that would exceed the
-per-installation concurrency cap defers (a DB-backed in-flight slot, released on every
-exit path).  If it proceeds, it
+per-installation concurrency cap re-queues itself via ``arq.Retry`` (bounded by
+``WorkerSettings.max_tries``) and re-runs when a slot frees rather than being dropped;
+the in-flight slot is claimed only when available and released on every exit path.  If
+it proceeds, it
 assembles the PR seed context into a temporary workspace once (including the PR's kept
 conversation comments — human and Heimdall's own — exposed via ``heimdall-context
 comments``, its kept inline review threads via ``heimdall-context review-threads``, its
@@ -259,6 +261,9 @@ async def run_review(
                 config.caps.max_concurrent_per_installation,
                 _CONCURRENCY_DEFER_SECONDS,
             )
+            # Each deferral re-runs the whole job from the top, re-paying _gate_review's
+            # GitHub reads (get_pr / heimdall.yml / get_pr_files) before reaching here
+            # again — cheap relative to the lens fanout, and bounded by max_tries.
             raise Retry(defer=_CONCURRENCY_DEFER_SECONDS)
         # The slot is now held; release it on EVERY exit path (success, skip,
         # failure, exception) so the counter cannot leak.
@@ -332,10 +337,12 @@ async def _review_and_post(
     """Run the retried pipeline and post exactly one review (or a failure note).
 
     The core of run_review, extracted so the per-installation concurrency
-    acquire/release can wrap it in a clean try/finally.  Mirrors the prior inline
-    body: on a None synthesis it posts a terse failure note and records the SHA;
-    on success it retires the prior review, splits inline/body, posts once, and
-    records both the posted-review and last-reviewed SHA.
+    acquire/release can wrap it in a clean try/finally.  On a None synthesis it
+    posts a terse failure note and records the SHA; on success it retires the prior
+    review, splits inline/body, posts once, and records both the posted-review and
+    last-reviewed SHA.  A failure in that post/persist phase is caught here (not
+    propagated to arq): it is converted to a terse failure note + recorded SHA, so a
+    transient GitHub outage can't trigger a full, expensive 3-lens + synthesis replay.
     """
     synthesis = await _run_pipeline_with_retry(
         ctx,
@@ -349,17 +356,69 @@ async def _review_and_post(
         # Every lens failed, synthesis aborted, or the retry timed out/failed.
         # Post a terse failure note and record the SHA so the failed commit is
         # not endlessly re-reviewed.
-        await _post_review_failed_note(
+        await _best_effort_failure_note_and_record_sha(
             github_client,
+            db,
             repo_full_name=repo_full_name,
             pr_number=pr_number,
             head_sha=head_sha,
         )
-        await set_last_reviewed_sha(
-            db, repo_full_name=repo_full_name, pr_number=pr_number, sha=head_sha
+        return
+
+    try:
+        await _post_synthesized_review(
+            github_client,
+            db,
+            synthesis=synthesis,
+            repo_full_name=repo_full_name,
+            pr_number=pr_number,
+            head_sha=head_sha,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # WHY: the expensive pipeline already SUCCEEDED — a failure here is in the
+        # post/persist phase (GitHub round-trips, retire-prior, persist).  Left to
+        # propagate it reaches arq, which replays the ENTIRE 3-lens + synthesis
+        # pipeline (the SHA is recorded only after a successful post), up to
+        # max_tries times — burning expensive LLM passes on what is really a GitHub
+        # outage.  Instead: log, post a terse failure note, record the SHA, and
+        # return cleanly so the commit is not re-reviewed.  A duplicate terse note is
+        # tolerated over a full replay.  asyncio.CancelledError is a BaseException
+        # (not Exception), so job_timeout/cancellation is intentionally NOT caught
+        # and still propagates.
+        logger.warning(
+            "Post phase failed for %s#%d @ %s: %s; posting failure note instead",
+            repo_full_name,
+            pr_number,
+            head_sha,
+            type(exc).__name__,
+        )
+        await _best_effort_failure_note_and_record_sha(
+            github_client,
+            db,
+            repo_full_name=repo_full_name,
+            pr_number=pr_number,
+            head_sha=head_sha,
         )
         return
 
+
+async def _post_synthesized_review(
+    github_client: GitHubClient,
+    db: Database,
+    *,
+    synthesis: SynthesisResult,
+    repo_full_name: str,
+    pr_number: int,
+    head_sha: str,
+) -> None:
+    """Retire the prior review, post the synthesized review, and persist the SHA.
+
+    The post/persist phase that runs once the pipeline has produced a real
+    synthesis.  Extracted so the caller can wrap it in a single try/except: a raise
+    anywhere here (a GitHub round-trip, the post, or the persist) is caught by
+    _review_and_post and converted to a terse failure note rather than triggering a
+    full-pipeline replay through arq.
+    """
     # Across-push lifecycle: retire the prior Heimdall review (dismiss a
     # REQUEST_CHANGES, minimize a COMMENT) and delete its now-stale inline
     # comments before posting, so only the latest review stays active.
@@ -407,6 +466,44 @@ async def _review_and_post(
     )
     logger.info(
         "Review posted for %s#%d @ %s", repo_full_name, pr_number, head_sha
+    )
+
+
+async def _best_effort_failure_note_and_record_sha(
+    github_client: GitHubClient,
+    db: Database,
+    *,
+    repo_full_name: str,
+    pr_number: int,
+    head_sha: str,
+) -> None:
+    """Post the terse failure note (best-effort) and ALWAYS record the SHA.
+
+    Shared by both failure paths — a None synthesis and a post-phase failure — so
+    they don't duplicate the note+record-SHA pair.  The note post is best-effort: it
+    may itself fail (GitHub down/throttled), but the SHA is recorded regardless so
+    the failed commit is not endlessly re-reviewed.
+    """
+    try:
+        await _post_review_failed_note(
+            github_client,
+            repo_full_name=repo_full_name,
+            pr_number=pr_number,
+            head_sha=head_sha,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # WHY: GitHub is likely down/throttled (the same fault that brought us here).
+        # A missing failure note is acceptable; a full-pipeline replay because the SHA
+        # was never recorded is not — so swallow and still record the SHA below.
+        logger.warning(
+            "Could not post review-failed note for %s#%d @ %s: %s",
+            repo_full_name,
+            pr_number,
+            head_sha,
+            type(exc).__name__,
+        )
+    await set_last_reviewed_sha(
+        db, repo_full_name=repo_full_name, pr_number=pr_number, sha=head_sha
     )
 
 
@@ -959,12 +1056,13 @@ class WorkerSettings:
 
     functions = [run_review]
     # Max attempts arq makes per job before giving up.  Raised from arq's default of 5
-    # because a concurrency-cap miss now re-queues via Retry(defer=_CONCURRENCY_DEFER_
-    # SECONDS) and each deferral spends one try; 15 gives ~14 min of patience for a slot
-    # to free before the job is dropped.  Safe to raise this high: genuine pipeline
+    # because a concurrency-cap miss now re-queues via Retry(defer=_CONCURRENCY_DEFER_SECONDS)
+    # and each deferral spends one try; 15 gives ~14 min of patience — total patience is
+    # (max_tries - 1) * _CONCURRENCY_DEFER_SECONDS — for a slot to free before the job is
+    # dropped.  Safe to raise this high: BOTH genuine pipeline failures AND post-phase
     # failures are caught and posted as a "review failed" note inside _review_and_post
-    # (which records the SHA and returns cleanly), so they do NOT consume retries — only
-    # cap deferrals and rare infra-level exceptions do.
+    # (which records the SHA and returns cleanly), so neither consumes retries — only cap
+    # deferrals and cheap pre-pipeline infra errors (before the expensive fanout) do.
     max_tries: int = 15
     # Overridden from the configured REDIS_URL in main() at process start (arq reads
     # this attribute before on_startup runs); the localhost default keeps it a valid

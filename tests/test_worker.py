@@ -1150,6 +1150,101 @@ async def test_run_review_pipeline_timeout_surfaced_as_failure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_post_phase_failure_posts_failure_note_and_records_sha() -> None:
+    """A post-phase failure must not trigger a full expensive pipeline replay.
+
+    Synthesis SUCCEEDS (the costly lens fanout + synthesis ran once), but the real
+    review post fails.  Rather than letting that propagate to arq — which would replay
+    the whole 3-lens + synthesis pipeline (the SHA is recorded only after a successful
+    post) — _review_and_post catches it, posts a terse failure note, and records the
+    SHA so the commit is not re-reviewed.  Here the failure-note post (the second
+    post_review call) succeeds.
+    """
+    mock_gh_client = _gh_client()
+    # First post_review (the real review) raises; the second (the failure note) is OK.
+    mock_gh_client.post_review = AsyncMock(
+        side_effect=[RuntimeError("post boom"), {"id": 1, "node_id": "NODE"}]
+    )
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    synthesis = _synthesis_from([_tagged(Severity.LOW, "cleanliness", "nit", "style")])
+    synthesize_mock = AsyncMock(return_value=synthesis)
+    with (
+        patch("heimdall.worker._gate_review", new=AsyncMock(return_value=RepoConfig())),
+        patch("heimdall.worker._over_rate_budget", new=AsyncMock(return_value=False)),
+        patch("heimdall.worker.try_acquire_inflight", new=AsyncMock(return_value=True)),
+        patch("heimdall.worker.try_record_review_event", new=AsyncMock()),
+        patch("heimdall.worker.release_inflight", new=AsyncMock()),
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None)),
+        patch("heimdall.worker.get_posted_review", new=AsyncMock(return_value=None)),
+        patch("heimdall.worker._synthesize_review", new=synthesize_mock),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()) as mock_set,
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        # 1. Returns WITHOUT raising — the post failure is caught, not propagated.
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    # 2. The LAST post is the terse failure note, posted as a COMMENT.
+    last_post = mock_gh_client.post_review.await_args_list[-1].kwargs
+    assert last_post["event"] == "COMMENT"
+    assert "failed" in last_post["body"].lower()
+    # 3. The SHA is recorded so the commit is not endlessly re-reviewed (no replay).
+    mock_set.assert_awaited()
+    # 4. The expensive pipeline ran EXACTLY once — no full replay on a post failure.
+    assert synthesize_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_post_phase_failure_swallows_failed_note_error_but_still_records_sha() -> None:
+    """Even if the failure note itself can't be posted, the SHA is still recorded.
+
+    GitHub is fully down: both the real review post AND the failure-note post raise.
+    The fallback must swallow the note error (a missing note is acceptable) and still
+    record the SHA, so a persistent post outage never causes a full-pipeline replay.
+    """
+    mock_gh_client = _gh_client()
+    # Both posts raise: the real review AND the failure note.
+    mock_gh_client.post_review = AsyncMock(
+        side_effect=[RuntimeError("post boom"), RuntimeError("note boom")]
+    )
+    ctx: dict[str, object] = {"db": AsyncMock(), "app_id": _APP_ID, "private_key": _PRIVATE_KEY}
+
+    synthesis = _synthesis_from([_tagged(Severity.LOW, "cleanliness", "nit", "style")])
+    synthesize_mock = AsyncMock(return_value=synthesis)
+    with (
+        patch("heimdall.worker._gate_review", new=AsyncMock(return_value=RepoConfig())),
+        patch("heimdall.worker._over_rate_budget", new=AsyncMock(return_value=False)),
+        patch("heimdall.worker.try_acquire_inflight", new=AsyncMock(return_value=True)),
+        patch("heimdall.worker.try_record_review_event", new=AsyncMock()),
+        patch("heimdall.worker.release_inflight", new=AsyncMock()),
+        patch("heimdall.worker.get_last_reviewed_sha", new=AsyncMock(return_value=None)),
+        patch("heimdall.worker.get_posted_review", new=AsyncMock(return_value=None)),
+        patch("heimdall.worker._synthesize_review", new=synthesize_mock),
+        patch("heimdall.worker.set_last_reviewed_sha", new=AsyncMock()) as mock_set,
+        patch("heimdall.worker.set_posted_review", new=AsyncMock()),
+        patch("heimdall.worker.GitHubClient", return_value=mock_gh_client),
+    ):
+        # Returns WITHOUT raising even though both posts failed.
+        await run_review(
+            ctx,
+            installation_id=_INSTALL_ID,
+            repo_full_name=_REPO,
+            pr_number=_PR,
+            head_sha=_SHA,
+        )
+
+    # The SHA is still recorded — no replay even when the note can't be posted.
+    mock_set.assert_awaited()
+
+
+@pytest.mark.asyncio
 async def test_run_review_skips_already_reviewed_sha() -> None:
     """Worker skips posting (and the lenses) if the head SHA was already reviewed."""
     mock_gh_client = AsyncMock()
@@ -2347,7 +2442,7 @@ async def test_rate_budget_uses_real_db_window() -> None:
 
 
 @pytest.mark.asyncio
-async def test_concurrency_cap_defers_when_at_limit() -> None:
+async def test_concurrency_cap_raises_retry_when_at_limit() -> None:
     """Acceptance #3: at the concurrency cap, the run re-queues itself via arq.Retry.
 
     A cap miss must NOT silently drop the commit (the old behaviour: ``return`` ends the
