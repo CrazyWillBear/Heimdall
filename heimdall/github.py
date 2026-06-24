@@ -17,13 +17,14 @@ import jwt
 
 logger = logging.getLogger(__name__)
 
-# Hard ceiling on pages any single comment/review pagination loop will fetch.
-# GitHub serves up to 100 items/page, so 50 pages == 5000 items — far beyond any
-# realistic human PR discussion, yet finite so an attacker-influenceable PR with a
-# pathologically large discussion can't drive unbounded API calls / memory / time
-# per review (resource-exhaustion hardening). Hitting it logs a WARNING so the
-# resulting truncation is never silent.
-_MAX_COMMENT_PAGES = 50
+# Hard ceiling on pages any single pagination loop will fetch — comments,
+# submitted reviews, and GraphQL review threads alike. GitHub serves up to 100
+# items/page, so 50 pages == 5000 items — far beyond any realistic human PR
+# discussion, yet finite so an attacker-influenceable PR with a pathologically
+# large discussion can't drive unbounded API calls / memory / time per review
+# (resource-exhaustion hardening). Hitting it logs a WARNING so the resulting
+# truncation is never silent.
+_MAX_PAGINATION_PAGES = 50
 
 
 def parse_linked_issues_from_body(body: str) -> list[dict[str, Any]]:
@@ -458,11 +459,11 @@ class GitHubClient:
             all_comments.extend(response.json())
             url = self._next_page_url(response.headers.get("link", ""))
             page_count += 1
-            if url is not None and page_count >= _MAX_COMMENT_PAGES:
+            if url is not None and page_count >= _MAX_PAGINATION_PAGES:
                 logger.warning(
                     "list_review_comments hit the %d-page ceiling for %s#%s "
                     "review %s; truncating remaining inline comments",
-                    _MAX_COMMENT_PAGES, repo_full_name, pr_number, review_id,
+                    _MAX_PAGINATION_PAGES, repo_full_name, pr_number, review_id,
                 )
                 break
         return all_comments
@@ -582,6 +583,11 @@ class GitHubClient:
         all_files: list[dict[str, Any]] = []
         first_page = True
 
+        # Intentionally unbounded (no _MAX_PAGINATION_PAGES ceiling): GitHub caps a
+        # PR at ~3000 files == ~30 pages at 100/page, already under the 50-page
+        # ceiling, so the file count is bounded upstream by GitHub itself. This is a
+        # deliberate policy difference from the comment/review loops, not an
+        # oversight.
         while url is not None:
             # Only attach params on the first request. GitHub's next-page URLs
             # already carry page= and per_page= in their query string; passing
@@ -688,11 +694,11 @@ class GitHubClient:
                     kept.append(_shape_comment(raw))
             url = self._next_page_url(response.headers.get("link", ""))
             page_count += 1
-            if url is not None and page_count >= _MAX_COMMENT_PAGES:
+            if url is not None and page_count >= _MAX_PAGINATION_PAGES:
                 logger.warning(
                     "get_pr_conversation_comments hit the %d-page ceiling for "
                     "%s#%s; truncating remaining conversation comments",
-                    _MAX_COMMENT_PAGES, repo_full_name, pr_number,
+                    _MAX_PAGINATION_PAGES, repo_full_name, pr_number,
                 )
                 break
         return kept
@@ -762,11 +768,11 @@ class GitHubClient:
                     kept.append(raw)
             url = self._next_page_url(response.headers.get("link", ""))
             page_count += 1
-            if url is not None and page_count >= _MAX_COMMENT_PAGES:
+            if url is not None and page_count >= _MAX_PAGINATION_PAGES:
                 logger.warning(
                     "get_pr_review_comments hit the %d-page ceiling for %s#%s; "
                     "truncating remaining inline comment threads",
-                    _MAX_COMMENT_PAGES, repo_full_name, pr_number,
+                    _MAX_PAGINATION_PAGES, repo_full_name, pr_number,
                 )
                 break
         resolution = await self.get_review_thread_resolutions(
@@ -819,14 +825,6 @@ class GitHubClient:
         page_count = 0
         try:
             while True:
-                page_count += 1
-                if page_count > _MAX_COMMENT_PAGES:
-                    logger.warning(
-                        "get_review_thread_resolutions hit the %d-page ceiling "
-                        "for %s#%s; treating remaining threads as unresolved",
-                        _MAX_COMMENT_PAGES, repo_full_name, pr_number,
-                    )
-                    break
                 response = await self._http.post(
                     f"{self._BASE}/graphql",
                     headers=await self._gh_headers(),
@@ -868,6 +866,14 @@ class GitHubClient:
                     break
                 after = page_info.get("endCursor")
                 if after is None:
+                    break
+                page_count += 1
+                if page_count >= _MAX_PAGINATION_PAGES:
+                    logger.warning(
+                        "get_review_thread_resolutions hit the %d-page ceiling "
+                        "for %s#%s; treating remaining threads as unresolved",
+                        _MAX_PAGINATION_PAGES, repo_full_name, pr_number,
+                    )
                     break
         except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
             logger.warning(
@@ -915,11 +921,11 @@ class GitHubClient:
             all_reviews.extend(response.json())
             url = self._next_page_url(response.headers.get("link", ""))
             page_count += 1
-            if url is not None and page_count >= _MAX_COMMENT_PAGES:
+            if url is not None and page_count >= _MAX_PAGINATION_PAGES:
                 logger.warning(
                     "_list_pr_reviews hit the %d-page ceiling for %s#%s; "
                     "truncating remaining submitted reviews",
-                    _MAX_COMMENT_PAGES, repo_full_name, pr_number,
+                    _MAX_PAGINATION_PAGES, repo_full_name, pr_number,
                 )
                 break
         return all_reviews

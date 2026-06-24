@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from heimdall.github import (
-    _MAX_COMMENT_PAGES,
+    _MAX_PAGINATION_PAGES,
     GitHubClient,
     make_jwt,
     parse_linked_issues_from_body,
@@ -788,7 +788,7 @@ async def test_get_review_thread_resolutions_follows_graphql_pagination() -> Non
 
 
 # ---------------------------------------------------------------------------
-# Comment/review pagination page ceiling (_MAX_COMMENT_PAGES): an attacker-
+# Comment/review pagination page ceiling (_MAX_PAGINATION_PAGES): an attacker-
 # influenceable PR with a pathologically large discussion can't drive unbounded
 # pagination. Each loop stops at the ceiling and logs a truncation WARNING.
 # ---------------------------------------------------------------------------
@@ -799,7 +799,7 @@ def _perpetual_next_get() -> tuple[AsyncMock, list[int]]:
 
     Returns the mock alongside a one-element call counter (``calls[0]``). The Link
     header never terminates, so a loop with no ceiling would never stop — the ceiling
-    must cap the GET count at ``_MAX_COMMENT_PAGES``.
+    must cap the GET count at ``_MAX_PAGINATION_PAGES``.
     """
     calls = [0]
 
@@ -821,7 +821,7 @@ def _perpetual_next_get() -> tuple[AsyncMock, list[int]]:
 async def test_get_pr_conversation_comments_stops_at_page_ceiling(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A never-ending next-link is bounded at _MAX_COMMENT_PAGES with a WARNING."""
+    """A never-ending next-link is bounded at _MAX_PAGINATION_PAGES with a WARNING."""
     mock_get, calls = _perpetual_next_get()
     mock_http = AsyncMock()
     mock_http.get = mock_get
@@ -837,8 +837,8 @@ async def test_get_pr_conversation_comments_stops_at_page_ceiling(
                 repo_full_name="owner/repo", pr_number=5
             )
 
-    assert calls[0] == _MAX_COMMENT_PAGES
-    assert len(rows) == _MAX_COMMENT_PAGES
+    assert calls[0] == _MAX_PAGINATION_PAGES
+    assert len(rows) == _MAX_PAGINATION_PAGES
     assert any(
         "ceiling" in r.message and "get_pr_conversation_comments" in r.message
         for r in caplog.records
@@ -867,7 +867,7 @@ async def test_get_pr_review_comments_stops_at_page_ceiling(
                 repo_full_name="owner/repo", pr_number=5
             )
 
-    assert calls[0] == _MAX_COMMENT_PAGES
+    assert calls[0] == _MAX_PAGINATION_PAGES
     assert any(
         "ceiling" in r.message and "get_pr_review_comments" in r.message
         for r in caplog.records
@@ -894,7 +894,7 @@ async def test_list_pr_reviews_stops_at_page_ceiling(
                 repo_full_name="owner/repo", pr_number=5
             )
 
-    assert calls[0] == _MAX_COMMENT_PAGES
+    assert calls[0] == _MAX_PAGINATION_PAGES
     assert any(
         "ceiling" in r.message and "_list_pr_reviews" in r.message
         for r in caplog.records
@@ -921,8 +921,8 @@ async def test_list_review_comments_stops_at_page_ceiling(
                 repo_full_name="owner/repo", pr_number=5, review_id=77
             )
 
-    assert calls[0] == _MAX_COMMENT_PAGES
-    assert len(rows) == _MAX_COMMENT_PAGES
+    assert calls[0] == _MAX_PAGINATION_PAGES
+    assert len(rows) == _MAX_PAGINATION_PAGES
     assert any(
         "ceiling" in r.message and "list_review_comments" in r.message
         for r in caplog.records
@@ -980,7 +980,7 @@ async def test_get_review_thread_resolutions_stops_at_page_ceiling(
                 repo_full_name="owner/repo", pr_number=5
             )
 
-    assert calls[0] == _MAX_COMMENT_PAGES
+    assert calls[0] == _MAX_PAGINATION_PAGES
     assert resolutions
     assert any(
         "ceiling" in r.message and "get_review_thread_resolutions" in r.message
